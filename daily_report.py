@@ -7,6 +7,8 @@ import datetime
 import asyncio
 import requests
 import os
+import re
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 # 載入 .env 檔案
@@ -26,66 +28,96 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_institutional_data():
-    """終極防護版：抓取三大法人買賣超 (OpenAPI + 防呆解析)"""
+    """終極防護版：抓取三大法人買賣超 (主引擎: Yahoo股市 / 備用: OpenAPI)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
     }
     
-    # 引擎 1：證交所 OpenAPI (最安全，不擋雲端 IP)
+    # ==========================================
+    # 引擎 1：Yahoo 股市 (最強抗封鎖，單位已為億)
+    # ==========================================
+    try:
+        url_yahoo = "https://tw.stock.yahoo.com/institutional-trading"
+        res = requests.get(url_yahoo, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        texts = list(soup.stripped_strings)
+        
+        foreign = trust = dealer = None
+        
+        for i, text in enumerate(texts):
+            # 抓取外資
+            if foreign is None and ("外資及陸資" in text or text == "外資"):
+                nums = []
+                for j in range(1, 20):
+                    if i + j < len(texts):
+                        val = texts[i+j].replace(',', '').replace('億', '').strip()
+                        if val.startswith('+'): val = val[1:] # 忽略正號
+                        if re.match(r'^[-]?\d+(\.\d+)?$', val):
+                            nums.append(float(val))
+                            if len(nums) == 3: # 第三個數字即為買賣超
+                                foreign = nums[2]
+                                break
+            # 抓取投信
+            elif trust is None and text == "投信":
+                nums = []
+                for j in range(1, 20):
+                    if i + j < len(texts):
+                        val = texts[i+j].replace(',', '').replace('億', '').strip()
+                        if val.startswith('+'): val = val[1:]
+                        if re.match(r'^[-]?\d+(\.\d+)?$', val):
+                            nums.append(float(val))
+                            if len(nums) == 3:
+                                trust = nums[2]
+                                break
+            # 抓取自營商
+            elif dealer is None and text == "自營商":
+                nums = []
+                for j in range(1, 20):
+                    if i + j < len(texts):
+                        val = texts[i+j].replace(',', '').replace('億', '').strip()
+                        if val.startswith('+'): val = val[1:]
+                        if re.match(r'^[-]?\d+(\.\d+)?$', val):
+                            nums.append(float(val))
+                            if len(nums) == 3:
+                                dealer = nums[2]
+                                break
+                                
+            if foreign is not None and trust is not None and dealer is not None:
+                break
+                
+        if foreign is not None and trust is not None and dealer is not None:
+            return round(foreign, 1), round(trust, 1), round(dealer, 1)
+    except Exception as e:
+        print(f"Yahoo 股市抓取失敗: {e}")
+
+    # ==========================================
+    # 引擎 2：證交所 OpenAPI (備用方案)
+    # ==========================================
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
         res = requests.get(open_url, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            foreign = trust = dealer = 0
-            
+            f_val = t_val = d_val = 0
             for row in data:
-                # 無敵防呆法：將這行的所有數值組合成字串，用來判斷是哪個法人，無視欄位順序變動
                 joined_vals = " | ".join([str(v) for v in row.values()])
-                
-                # 從後面倒著找，找到的第一個數字通常就是「買賣差額」
                 diff = 0
                 for v in reversed(list(row.values())):
                     try:
                         diff = int(str(v).replace(',', '').strip())
                         break
-                    except ValueError:
-                        pass
+                    except ValueError: pass
                         
-                # 精準比對名稱並累加
-                if "外資及陸資(不含外資自營商)" in joined_vals:
-                    foreign += diff
+                if "外資及陸資" in joined_vals and "不含" in joined_vals:
+                    f_val += diff
                 elif "投信" in joined_vals:
-                    trust += diff
-                elif "自營商(自行買賣)" in joined_vals or "自營商(避險)" in joined_vals:
-                    dealer += diff
-            
-            # 如果有成功抓到數據 (換算成億)
-            if foreign != 0 or trust != 0 or dealer != 0:
-                return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
+                    t_val += diff
+                elif "自營商" in joined_vals:
+                    d_val += diff
+            if f_val != 0 or t_val != 0 or d_val != 0:
+                return round(f_val / 100000000, 1), round(t_val / 100000000, 1), round(d_val / 100000000, 1)
     except Exception as e:
         print(f"OpenAPI 抓取失敗: {e}")
-
-    # 引擎 2：傳統主網 (備用)
-    import time
-    url = "https://www.twse.com.tw/fund/BFI82U?response=json"
-    for attempt in range(2):
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                foreign = trust = dealer = 0
-                for row in data.get("data", []):
-                    name = row[0]
-                    try: net = int(row[3].replace(",", ""))
-                    except: net = 0
-                    if "外資" in name and "不含" in name: foreign += net
-                    elif "投信" in name: trust += net
-                    elif "自營商" in name: dealer += net
-                if foreign != 0 or trust != 0 or dealer != 0:
-                    return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
-        except:
-            time.sleep(2)
 
     return None, None, None
 
@@ -153,7 +185,7 @@ def generate_market_text():
                   f"• **櫃買指數 (中小型)**：`{c_otc['Close']:,.2f}` 點 ({otc_icon} {pct_otc:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
 
-    # --- 2. 法人籌碼 (防呆修復版) ---
+    # --- 2. 法人籌碼 (Yahoo 版) ---
     if foreign is not None:
         total_net = foreign + trust + dealer
         inst_text = (f"今日三大法人合計：**{total_net:+.1f} 億元**\n"
@@ -244,7 +276,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！(已啟動週末避開機制)')
+    print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！(已升級 Yahoo 爬蟲)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
