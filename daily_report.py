@@ -9,21 +9,16 @@ import requests
 import os
 from dotenv import load_dotenv
 
-# 載入 .env 檔案 (在 Railway 上執行時，這行不會報錯，會自動去抓 Railway 後台的變數)
+# 載入 .env 檔案
 load_dotenv()
 
 # ================= 絕對必填設定區 =================
-# 1. 透過環境變數安全讀取 Token (請在 .env 或 Railway 後台設定 DISCORD_TOKEN)
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# 安全機制：如果抓不到 Token，直接停止執行並報錯
 if not TOKEN:
     raise ValueError("❌ 找不到 DISCORD_TOKEN！請確認 .env 檔案或 Railway 環境變數是否已設定。")
 
-# 2. 這裡填入你要發送報告的頻道數字 ID (不要加引號)
 target_channel_id = 1475023963334643793
-
-# 自動播報時間設定 (24小時制，台灣時間)
 DAILY_REPORT_TIME = "17:00"   
 # ==================================================
 
@@ -31,27 +26,64 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_institutional_data():
-    """抓取三大法人 (使用最穩定的主網站 API)"""
-    url = "https://www.twse.com.tw/fund/BFI82U?response=json"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
+    """抓取三大法人 (雙重引擎防阻擋：OpenAPI + TWSE主網)"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    }
     import time
-    for attempt in range(3):
+
+    # ==========================================
+    # 引擎 1：證交所 OpenAPI (專為機器人設計，不擋 Railway 雲端 IP)
+    # ==========================================
+    try:
+        open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
+        res = requests.get(open_url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                foreign = trust = dealer = 0
+                for row in data:
+                    vals = list(row.values())
+                    if len(vals) >= 4:
+                        name = str(vals[0])
+                        diff_str = str(vals[3]) # 第四個欄位通常是買賣差額
+                        try:
+                            net = int(diff_str.replace(",", ""))
+                        except:
+                            net = 0
+
+                        if "外資" in name and "不含" in name: foreign += net
+                        elif "投信" in name: trust += net
+                        elif "自營商" in name: dealer += net
+
+                # 如果有成功抓到數據，直接回傳
+                if foreign != 0 or trust != 0 or dealer != 0:
+                    return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
+    except Exception as e:
+        print(f"OpenAPI 抓取失敗: {e}")
+
+    # ==========================================
+    # 引擎 2：原版 TWSE 主網 (若 OpenAPI 維修，且本機執行時可作備用)
+    # ==========================================
+    url = "https://www.twse.com.tw/fund/BFI82U?response=json"
+    for attempt in range(2):
         try:
-            res = requests.get(url, headers=headers, timeout=10)
+            res = requests.get(url, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                if data.get("stat") != "OK" or "data" not in data:
-                    time.sleep(3); continue 
-                foreign = trust = dealer = 0
-                for row in data["data"]:
-                    name = row[0]
-                    try: net = int(row[3].replace(",", ""))
-                    except: net = 0
-                    if "外資" in name and "不含" in name: foreign += net
-                    elif "投信" in name: trust += net
-                    elif "自營商" in name: dealer += net
-                return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
-        except: time.sleep(3)
+                if data.get("stat") == "OK" and "data" in data:
+                    foreign = trust = dealer = 0
+                    for row in data["data"]:
+                        name = row[0]
+                        try: net = int(row[3].replace(",", ""))
+                        except: net = 0
+                        if "外資" in name and "不含" in name: foreign += net
+                        elif "投信" in name: trust += net
+                        elif "自營商" in name: dealer += net
+                    return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
+        except:
+            time.sleep(2)
+
     return None, None, None
 
 def calculate_technical_indicators(df):
@@ -82,7 +114,6 @@ def calculate_technical_indicators(df):
 def generate_market_text():
     """自動抓取大盤與櫃買數據並生成分析文字"""
     print("🔄 正在抓取雙引擎大盤(加權+櫃買)與國際資料...")
-    # ✨ 新增：抓取櫃買指數 (^TWOII)
     twii = yf.Ticker("^TWII").history(period="3mo")
     otc = yf.Ticker("^TWOII").history(period="3mo")
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
@@ -99,14 +130,13 @@ def generate_market_text():
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    # --- 1. 雙引擎比較：加權 vs 櫃買 (NEW!) ---
+    # --- 1. 雙引擎比較：加權 vs 櫃買 ---
     pct_tw = ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
     pct_otc = ((c_otc['Close'] - p_otc['Close']) / p_otc['Close']) * 100
     
     tw_icon = "🔴" if pct_tw > 0 else "🟢"
     otc_icon = "🔴" if pct_otc > 0 else "🟢"
     
-    # AI 動態判斷資金流向
     if pct_otc > pct_tw and pct_otc > 0:
         market_style = "【內資作帳，中小型股活潑】櫃買漲幅勝過大盤，顯示本土資金與主力大戶非常活躍，選股不選市，是進場做多中小型飆股的好時機！"
     elif pct_tw > pct_otc and pct_tw > 0:
@@ -162,7 +192,7 @@ def generate_market_text():
 
 async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
-    data = generate_market_text()
+    data = await asyncio.to_thread(generate_market_text) # 將整個爬蟲放入背景執行防卡死
     if not data:
         await msg.edit(content="⚠️ 資料抓取失敗，請檢查 Yahoo Finance 或連線狀態。")
         return
@@ -177,7 +207,6 @@ async def send_daily_report(channel):
         "### 🎯 【實戰操盤與支撐壓力】\n" + eval_text
     )
     
-    # 取得台灣時間作為標題日期
     tw_date = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
     
     embed = discord.Embed(
@@ -191,7 +220,6 @@ async def send_daily_report(channel):
 
 @tasks.loop(minutes=1)
 async def schedule_daily_report():
-    # 強制使用台灣時間 (UTC+8) 判斷
     tw_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     now = tw_time.strftime("%H:%M")
     
@@ -208,10 +236,6 @@ async def report(ctx):
 @bot.event
 async def on_ready():
     print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！')
-    if target_channel_id:
-        channel = bot.get_channel(target_channel_id)
-        if channel:
-            await channel.send(f"✅ **系統廣播**：頂級法人盤勢分析(含櫃買與大盤對照)已連線！每日 `{DAILY_REPORT_TIME}` 自動發布。")
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
