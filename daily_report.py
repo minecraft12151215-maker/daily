@@ -26,60 +26,63 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_institutional_data():
-    """抓取三大法人 (雙重引擎防阻擋：OpenAPI + TWSE主網)"""
+    """終極防護版：抓取三大法人買賣超 (OpenAPI + 防呆解析)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
     }
-    import time
-
-    # ==========================================
-    # 引擎 1：證交所 OpenAPI (專為機器人設計，不擋 Railway 雲端 IP)
-    # ==========================================
+    
+    # 引擎 1：證交所 OpenAPI (最安全，不擋雲端 IP)
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
-        res = requests.get(open_url, headers=headers, timeout=8)
+        res = requests.get(open_url, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            if isinstance(data, list) and len(data) > 0:
-                foreign = trust = dealer = 0
-                for row in data:
-                    vals = list(row.values())
-                    if len(vals) >= 4:
-                        name = str(vals[0])
-                        diff_str = str(vals[3]) # 第四個欄位通常是買賣差額
-                        try:
-                            net = int(diff_str.replace(",", ""))
-                        except:
-                            net = 0
-
-                        if "外資" in name and "不含" in name: foreign += net
-                        elif "投信" in name: trust += net
-                        elif "自營商" in name: dealer += net
-
-                # 如果有成功抓到數據，直接回傳
-                if foreign != 0 or trust != 0 or dealer != 0:
-                    return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
+            foreign = trust = dealer = 0
+            
+            for row in data:
+                # 無敵防呆法：將這行的所有數值組合成字串，用來判斷是哪個法人，無視欄位順序變動
+                joined_vals = " | ".join([str(v) for v in row.values()])
+                
+                # 從後面倒著找，找到的第一個數字通常就是「買賣差額」
+                diff = 0
+                for v in reversed(list(row.values())):
+                    try:
+                        diff = int(str(v).replace(',', '').strip())
+                        break
+                    except ValueError:
+                        pass
+                        
+                # 精準比對名稱並累加
+                if "外資及陸資(不含外資自營商)" in joined_vals:
+                    foreign += diff
+                elif "投信" in joined_vals:
+                    trust += diff
+                elif "自營商(自行買賣)" in joined_vals or "自營商(避險)" in joined_vals:
+                    dealer += diff
+            
+            # 如果有成功抓到數據 (換算成億)
+            if foreign != 0 or trust != 0 or dealer != 0:
+                return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
     except Exception as e:
         print(f"OpenAPI 抓取失敗: {e}")
 
-    # ==========================================
-    # 引擎 2：原版 TWSE 主網 (若 OpenAPI 維修，且本機執行時可作備用)
-    # ==========================================
+    # 引擎 2：傳統主網 (備用)
+    import time
     url = "https://www.twse.com.tw/fund/BFI82U?response=json"
     for attempt in range(2):
         try:
-            res = requests.get(url, headers=headers, timeout=8)
+            res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
                 data = res.json()
-                if data.get("stat") == "OK" and "data" in data:
-                    foreign = trust = dealer = 0
-                    for row in data["data"]:
-                        name = row[0]
-                        try: net = int(row[3].replace(",", ""))
-                        except: net = 0
-                        if "外資" in name and "不含" in name: foreign += net
-                        elif "投信" in name: trust += net
-                        elif "自營商" in name: dealer += net
+                foreign = trust = dealer = 0
+                for row in data.get("data", []):
+                    name = row[0]
+                    try: net = int(row[3].replace(",", ""))
+                    except: net = 0
+                    if "外資" in name and "不含" in name: foreign += net
+                    elif "投信" in name: trust += net
+                    elif "自營商" in name: dealer += net
+                if foreign != 0 or trust != 0 or dealer != 0:
                     return round(foreign / 100000000, 1), round(trust / 100000000, 1), round(dealer / 100000000, 1)
         except:
             time.sleep(2)
@@ -150,14 +153,14 @@ def generate_market_text():
                   f"• **櫃買指數 (中小型)**：`{c_otc['Close']:,.2f}` 點 ({otc_icon} {pct_otc:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
 
-    # --- 2. 法人籌碼 (修復版) ---
+    # --- 2. 法人籌碼 (防呆修復版) ---
     if foreign is not None:
         total_net = foreign + trust + dealer
         inst_text = (f"今日三大法人合計：**{total_net:+.1f} 億元**\n"
                      f"> • **外資**：`{foreign:+.1f} 億` ｜ **投信**：`{trust:+.1f} 億` ｜ **自營**：`{dealer:+.1f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
     else:
-        inst_text = "今日證交所法人數據尚未更新 (或逢假日未開盤)。"
+        inst_text = "今日證交所法人數據尚未更新 (或逢假日休市)。"
 
     # --- 3. 大盤技術指標深度分析 ---
     rsi, k, d, macd_hist = c_twii['RSI'], c_twii['K'], c_twii['D'], c_twii['Hist']
@@ -192,7 +195,7 @@ def generate_market_text():
 
 async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
-    data = await asyncio.to_thread(generate_market_text) # 將整個爬蟲放入背景執行防卡死
+    data = await asyncio.to_thread(generate_market_text) 
     if not data:
         await msg.edit(content="⚠️ 資料抓取失敗，請檢查 Yahoo Finance 或連線狀態。")
         return
@@ -222,20 +225,26 @@ async def send_daily_report(channel):
 async def schedule_daily_report():
     tw_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     now = tw_time.strftime("%H:%M")
+    weekday = tw_time.weekday() # 0=星期一, 5=星期六, 6=星期日
     
     if now == DAILY_REPORT_TIME and target_channel_id:
-        channel = bot.get_channel(target_channel_id)
-        if channel:
-            await send_daily_report(channel)
-            await asyncio.sleep(61) 
+        if weekday >= 5:
+            # ✅ 週末自動避開：不發送訊息，不打擾
+            print(f"【系統提示】今日為週末 (星期{weekday+1})，台股休市，大盤機器人自動避開播報。")
+        else:
+            channel = bot.get_channel(target_channel_id)
+            if channel:
+                await send_daily_report(channel)
+        await asyncio.sleep(61) 
 
 @bot.command()
 async def report(ctx):
+    # 手動指令依然能用，會自動抓取「上一個交易日」的資料
     await send_daily_report(ctx.channel)
 
 @bot.event
 async def on_ready():
-    print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！')
+    print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！(已啟動週末避開機制)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
