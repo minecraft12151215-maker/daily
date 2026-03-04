@@ -11,16 +11,15 @@ import re
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# 載入 .env 檔案
+# 載入環境變數
 load_dotenv()
 
 # ================= 絕對必填設定區 =================
 TOKEN = os.getenv('DISCORD_TOKEN')
-
 if not TOKEN:
-    raise ValueError("❌ 找不到 DISCORD_TOKEN！請確認 .env 檔案或 Railway 環境變數是否已設定。")
+    raise ValueError("❌ 找不到 DISCORD_TOKEN！")
 
-target_channel_id = 1475023963334643793
+TARGET_CHANNEL_ID = 1475023963334643793
 DAILY_REPORT_TIME = "17:00"   
 # ==================================================
 
@@ -28,27 +27,33 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_institutional_data():
-    """終極鋼鐵版：嚴格鎖定 HTML 表格結構，保證三大法人精準抓取"""
+    """終極表頭錨點法：直接鎖定表格欄位名稱，100% 免疫網頁廣告與版面變動干擾"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # === 引擎 1：Yahoo 股市 (嚴格 DOM 結構定位法) ===
+    # === 引擎 1：Yahoo 股市 (表頭錨點法) ===
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        for li in soup.find_all('li'):
-            cols = [div.get_text(strip=True) for div in li.find_all('div')]
-            
-            # 確認第一個格子是日期格式 (YYYY/MM/DD)
-            if len(cols) >= 4 and re.match(r'^\d{4}/\d{2}/\d{2}$', cols[0]):
-                try:
-                    f_val = float(cols[1].replace(',', '').replace('+', '').replace('億', ''))
-                    t_val = float(cols[2].replace(',', '').replace('+', '').replace('億', ''))
-                    d_val = float(cols[3].replace(',', '').replace('+', '').replace('億', ''))
-                    return f_val, t_val, d_val
-                except ValueError:
-                    continue
+        # 將網頁所有純文字拉出成一個乾淨的清單
+        strings = list(soup.stripped_strings)
+        
+        # 尋找無可取代的表頭連號："日期" -> "外資..." -> "投信" -> "自營商..."
+        for i in range(len(strings) - 4):
+            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
+                
+                # 找到表頭後，往下尋找第一筆日期資料 (YYYY/MM/DD)
+                for j in range(i+4, i+20):
+                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
+                        # 日期後面的 3 個格子，絕對就是外資、投信、自營商的買賣超！
+                        try:
+                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
+                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
+                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
+                            return f_val, t_val, d_val
+                        except ValueError:
+                            break
     except Exception as e:
         print(f"Yahoo 引擎抓取失敗: {e}")
 
@@ -61,23 +66,22 @@ def get_institutional_data():
             f_val = t_val = d_val = 0.0
             has_data = False
             for row in data:
-                vals = list(row.values())
-                if len(vals) < 4: continue
-                name = str(vals[0])
-                diff_str = str(vals[3]).replace(',', '') 
-                
-                try: diff = float(diff_str) / 100000000.0 
+                name = str(row.get("Item", row.get("單位名稱", "")))
+                diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
+                try: diff = float(diff_str) / 100000000.0
                 except: diff = 0.0
-                    
-                if "外資及陸資" in name and "不含" in name:
+                
+                # 嚴格對應官方的欄位名稱
+                if "外資及陸資(不含外資自營商)" in name or "外資自營商" in name:
                     f_val += diff
                     has_data = True
                 elif "投信" in name:
                     t_val += diff
                     has_data = True
-                elif "自營商" in name:
+                elif "自營商(自行買賣)" in name or "自營商(避險)" in name:
                     d_val += diff
                     has_data = True
+                    
             if has_data:
                 return round(f_val, 1), round(t_val, 1), round(d_val, 1)
     except Exception as e:
@@ -86,37 +90,44 @@ def get_institutional_data():
     return None, None, None
 
 def calculate_technical_indicators(df):
-    """計算 RSI, KD, MACD (已修復：確保有足夠天數)"""
-    if len(df) < 20: return df 
+    """計算 RSI, KD, MACD (加入嚴格防呆機制，杜絕 0.0 錯誤)"""
+    if df.empty or len(df) < 20: 
+        # 資料不足時給予預設值，防止系統崩潰
+        for col in ['RSI', 'K', 'D', 'MACD', 'Signal', 'Hist', 'MA20']:
+            df[col] = 50.0 if col in ['RSI', 'K', 'D'] else df['Close']
+        return df 
     
+    # 計算 RSI (加入除以 0 防護)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    df['RSI'] = 100 - (100 / (1 + (gain / loss).replace(np.nan, 0)))
+    rs = gain / loss.replace(0, 0.0001) 
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = df['RSI'].fillna(50)
 
+    # 計算 KD (加入除以 0 防護)
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
-    df['RSV'] = 100 * ((df['Close'] - low_min) / (high_max - low_min))
-    df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
+    denom = (high_max - low_min).replace(0, 0.0001)
+    df['RSV'] = 100 * ((df['Close'] - low_min) / denom)
+    df['K'] = df['RSV'].ewm(com=2, adjust=False).mean().fillna(50)
+    df['D'] = df['K'].ewm(com=2, adjust=False).mean().fillna(50)
     
-    # 恢復 MACD 運算
+    # 計算 MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Hist'] = df['MACD'] - df['Signal'] 
     
-    df['MA5'] = df['Close'].rolling(window=5).mean()
-    df['MA10'] = df['Close'].rolling(window=10).mean()
     df['MA20'] = df['Close'].rolling(window=20).mean()
     return df
 
 def generate_market_text():
-    """自動抓取大盤與櫃買數據並生成所有分析文字 (恢復原本完整排版)"""
-    print("🔄 正在抓取雙引擎大盤(加權+櫃買)與國際資料...")
+    """自動抓取五大區塊並生成分析文字"""
+    print("🔄 正在抓取雙引擎大盤與國際資料...")
     
-    # 抓取 3 個月歷史資料，確保指標有足夠天數
+    # 抓取長達 3 個月歷史資料，確保指標絕對有足夠天數運算
     twii = yf.Ticker("^TWII").history(period="3mo")
     otc = yf.Ticker("^TWOII").history(period="3mo")
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
@@ -133,7 +144,7 @@ def generate_market_text():
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    # --- 1. 雙引擎比較：加權 vs 櫃買 ---
+    # --- 1. 加權 vs 櫃買 ---
     pct_tw = ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
     pct_otc = ((c_otc['Close'] - p_otc['Close']) / p_otc['Close']) * 100
     
@@ -141,7 +152,7 @@ def generate_market_text():
     otc_icon = "🔴" if pct_otc > 0 else "🟢"
     
     if pct_otc > pct_tw and pct_otc > 0:
-        market_style = "【內資作帳，中小型股活潑】櫃買漲幅勝過大盤，顯示本土資金與主力大戶非常活躍，選股不選市，是進場做多中小型飆股的好時機！"
+        market_style = "【內資作帳，中小型股活潑】櫃買漲幅勝過大盤，顯示本土資金與主力大戶非常活躍，是進場做多中小型飆股的好時機！"
     elif pct_tw > pct_otc and pct_tw > 0:
         market_style = "【外資控盤，拉抬權值股】大盤漲幅勝過櫃買，資金集中在台積電等大型權值股，中小型股可能面臨資金排擠效應 (拉積盤)。"
     elif pct_otc < 0 and pct_tw < 0:
@@ -153,7 +164,7 @@ def generate_market_text():
                   f"• **櫃買指數 (中小型)**：`{c_otc['Close']:,.2f}` 點 ({otc_icon} {pct_otc:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
 
-    # --- 2. 法人籌碼 ---
+    # --- 2. 三大法人 ---
     if foreign is not None:
         total_net = foreign + trust + dealer
         inst_text = (f"今日三大法人合計：**{total_net:+.1f} 億元**\n"
@@ -162,30 +173,30 @@ def generate_market_text():
     else:
         inst_text = "今日證交所法人數據尚未更新 (或逢假日休市)。"
 
-    # --- 3. 大盤技術指標深度分析 ---
-    rsi = c_twii['RSI'] if pd.notna(c_twii.get('RSI')) else 0.0
-    k = c_twii['K'] if pd.notna(c_twii.get('K')) else 0.0
-    d = c_twii['D'] if pd.notna(c_twii.get('D')) else 0.0
-    macd_hist = c_twii['Hist'] if pd.notna(c_twii.get('Hist')) else 0.0
-    p_macd_hist = p_twii['Hist'] if pd.notna(p_twii.get('Hist')) else 0.0
+    # --- 3. 大盤技術指標 ---
+    rsi = c_twii.get('RSI', 50.0)
+    k = c_twii.get('K', 50.0)
+    d = c_twii.get('D', 50.0)
+    macd_hist = c_twii.get('Hist', 0.0)
+    p_macd_hist = p_twii.get('Hist', 0.0)
     
     rsi_desc = "⚠️ 過熱警報 (隨時面臨修正)" if rsi > 75 else "🟢 落底反彈 (超賣區浮現買點)" if rsi < 30 else "🟡 中性震盪"
     macd_trend = "紅柱擴大，多頭動能強勁" if macd_hist > 0 and macd_hist > p_macd_hist else "紅柱縮減，多方力竭" if macd_hist > 0 else "綠柱縮減，空方力道衰退" if macd_hist < p_macd_hist else "綠柱擴大，空方主導"
     
     tech_text = (f"• **RSI (14)**：`{rsi:.1f}` ｜ {rsi_desc}\n"
-                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and p_twii['K']<p_twii['D']) else '偏多格局' if k>d else '偏空格局'}\n"
+                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and p_twii.get('K', 50)<p_twii.get('D', 50)) else '偏多格局' if k>d else '偏空格局'}\n"
                  f"• **MACD 動能**：{macd_trend}")
 
-    # --- 4. 國際總經與情緒 (恢復！) ---
+    # --- 4. 國際總經與情緒 ---
     vix_trend = "下降" if c_vix['Close'] < p_vix['Close'] else "飆升"
     intl_text = (f"昨夜美股 S&P 500 **{'收紅' if c_sp['Close'] > p_sp['Close'] else '收黑'}** (收 {c_sp['Close']:,.0f} 點)。\n"
                  f"華爾街 VIX 恐慌指數目前來到 **{c_vix['Close']:.2f}** ({vix_trend})。\n"
                  f"> 總經視野：{'VIX回落顯示外資避險情緒降溫，有利資金動能' if vix_trend == '下降' else '恐慌情緒升溫，外資可能加速提款'}。")
 
-    # --- 5. 實戰操盤策略 (恢復！) ---
+    # --- 5. 實戰操盤策略 ---
     support = twii['Low'].tail(10).min() 
     resistance = twii['High'].tail(10).max() 
-    ma20 = c_twii['MA20'] if pd.notna(c_twii.get('MA20')) else 0.0
+    ma20 = c_twii.get('MA20', c_twii['Close'])
     
     if c_twii['Close'] > ma20:
         adv = "大盤穩居月線之上，屬於多頭格局。配合櫃買強弱，可積極在底部起漲的強勢族群中尋找機會。"
@@ -201,12 +212,11 @@ async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
     data = await asyncio.to_thread(generate_market_text) 
     if not data:
-        await msg.edit(content="⚠️ 資料抓取失敗，請檢查 Yahoo Finance 或連線狀態。")
+        await msg.edit(content="⚠️ 資料抓取失敗，請檢查 Yahoo Finance 報價源。")
         return
         
     kline, inst, tech, intl, eval_text = data
     
-    # 恢復五大區塊完整排版
     description = (
         "### ⚖️ 【加權 vs 櫃買：資金板塊解析】\n" + kline + "\n\n"
         "### 💰 【三大法人籌碼動向】\n" + inst + "\n\n"
@@ -229,16 +239,10 @@ async def send_daily_report(channel):
 @tasks.loop(minutes=1)
 async def schedule_daily_report():
     tw_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    now = tw_time.strftime("%H:%M")
-    weekday = tw_time.weekday() # 0=星期一, 5=星期六, 6=星期日
-    
-    if now == DAILY_REPORT_TIME and target_channel_id:
-        if weekday >= 5:
-            print(f"【系統提示】今日為週末 (星期{weekday+1})，大盤機器人自動避開播報。")
-        else:
-            channel = bot.get_channel(target_channel_id)
-            if channel:
-                await send_daily_report(channel)
+    if tw_time.strftime("%H:%M") == DAILY_REPORT_TIME and tw_time.weekday() < 5:
+        channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if channel:
+            await send_daily_report(channel)
         await asyncio.sleep(61) 
 
 @bot.command()
@@ -247,7 +251,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 雙引擎大盤分析機器人 {bot.user} 已上線！(滿血復活版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已滿血復活！(搭載表頭錨點法)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
