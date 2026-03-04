@@ -36,22 +36,18 @@ def get_institutional_data():
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 將網頁所有純文字拉出成一個乾淨的清單
         strings = list(soup.stripped_strings)
         
-        # 尋找無可取代的表頭連號："日期" -> "外資..." -> "投信" -> "自營商..."
         for i in range(len(strings) - 4):
             if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
-                
-                # 找到表頭後，往下尋找第一筆日期資料 (YYYY/MM/DD)
                 for j in range(i+4, i+20):
                     if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
-                        # 日期後面的 3 個格子，絕對就是外資、投信、自營商的買賣超！
                         try:
                             f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
                             t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
                             d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
-                            return f_val, t_val, d_val
+                            # ✅ 改為保留小數點後兩位
+                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
                         except ValueError:
                             break
     except Exception as e:
@@ -71,7 +67,6 @@ def get_institutional_data():
                 try: diff = float(diff_str) / 100000000.0
                 except: diff = 0.0
                 
-                # 嚴格對應官方的欄位名稱
                 if "外資及陸資(不含外資自營商)" in name or "外資自營商" in name:
                     f_val += diff
                     has_data = True
@@ -83,21 +78,20 @@ def get_institutional_data():
                     has_data = True
                     
             if has_data:
-                return round(f_val, 1), round(t_val, 1), round(d_val, 1)
+                # ✅ 改為保留小數點後兩位
+                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception as e:
         print(f"OpenAPI 備用引擎抓取失敗: {e}")
 
     return None, None, None
 
 def calculate_technical_indicators(df):
-    """計算 RSI, KD, MACD (加入嚴格防呆機制，杜絕 0.0 錯誤)"""
+    """計算 RSI, KD, MACD"""
     if df.empty or len(df) < 20: 
-        # 資料不足時給予預設值，防止系統崩潰
         for col in ['RSI', 'K', 'D', 'MACD', 'Signal', 'Hist', 'MA20']:
             df[col] = 50.0 if col in ['RSI', 'K', 'D'] else df['Close']
         return df 
     
-    # 計算 RSI (加入除以 0 防護)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -105,7 +99,6 @@ def calculate_technical_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     df['RSI'] = df['RSI'].fillna(50)
 
-    # 計算 KD (加入除以 0 防護)
     low_min = df['Low'].rolling(window=9).min()
     high_max = df['High'].rolling(window=9).max()
     denom = (high_max - low_min).replace(0, 0.0001)
@@ -113,7 +106,6 @@ def calculate_technical_indicators(df):
     df['K'] = df['RSV'].ewm(com=2, adjust=False).mean().fillna(50)
     df['D'] = df['K'].ewm(com=2, adjust=False).mean().fillna(50)
     
-    # 計算 MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
@@ -127,7 +119,6 @@ def generate_market_text():
     """自動抓取五大區塊並生成分析文字"""
     print("🔄 正在抓取雙引擎大盤與國際資料...")
     
-    # 抓取長達 3 個月歷史資料，確保指標絕對有足夠天數運算
     twii = yf.Ticker("^TWII").history(period="3mo")
     otc = yf.Ticker("^TWOII").history(period="3mo")
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
@@ -167,8 +158,9 @@ def generate_market_text():
     # --- 2. 三大法人 ---
     if foreign is not None:
         total_net = foreign + trust + dealer
-        inst_text = (f"今日三大法人合計：**{total_net:+.1f} 億元**\n"
-                     f"> • **外資**：`{foreign:+.1f} 億` ｜ **投信**：`{trust:+.1f} 億` ｜ **自營**：`{dealer:+.1f} 億`\n"
+        # ✅ 使用 +.2f 強制顯示小數點後兩位，沒有的會自動補 0
+        inst_text = (f"今日三大法人合計：**{total_net:+.2f} 億元**\n"
+                     f"> • **外資**：`{foreign:+.2f} 億` ｜ **投信**：`{trust:+.2f} 億` ｜ **自營**：`{dealer:+.2f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
     else:
         inst_text = "今日證交所法人數據尚未更新 (或逢假日休市)。"
@@ -251,7 +243,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已滿血復活！(搭載表頭錨點法)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(小數點 2 位精準版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
