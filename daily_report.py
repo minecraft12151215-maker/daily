@@ -17,9 +17,9 @@ load_dotenv()
 # ================= 絕對必填設定區 =================
 TOKEN = os.getenv('DISCORD_TOKEN')
 if not TOKEN:
-    raise ValueError("❌ 找不到 DISCORD_TOKEN！")
+    raise ValueError("❌ 找不到 DISCORD_TOKEN！請確認 .env 設定。")
 
-TARGET_CHANNEL_ID = 1475023963334643793
+TARGET_CHANNEL_ID = 1475023963334643793  
 DAILY_REPORT_TIME = "17:00"   
 # ==================================================
 
@@ -27,33 +27,10 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_institutional_data():
-    """終極表頭錨點法：直接鎖定表格欄位名稱，100% 免疫網頁廣告與版面變動干擾"""
+    """終極雙引擎：優先使用證交所 OpenAPI (最快最準)，失敗才切換 Yahoo 備用"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # === 引擎 1：Yahoo 股市 (表頭錨點法) ===
-    try:
-        url = "https://tw.stock.yahoo.com/institutional-trading"
-        res = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        strings = list(soup.stripped_strings)
-        
-        for i in range(len(strings) - 4):
-            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
-                for j in range(i+4, i+20):
-                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
-                        try:
-                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
-                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
-                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
-                            # ✅ 改為保留小數點後兩位
-                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
-                        except ValueError:
-                            break
-    except Exception as e:
-        print(f"Yahoo 引擎抓取失敗: {e}")
-
-    # === 引擎 2：證交所 OpenAPI (終極備用) ===
+    # === 🚀 主力引擎 1：證交所 OpenAPI (官方來源，保證不延遲) ===
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
         res = requests.get(open_url, headers=headers, timeout=10)
@@ -61,10 +38,12 @@ def get_institutional_data():
             data = res.json()
             f_val = t_val = d_val = 0.0
             has_data = False
+            
             for row in data:
                 name = str(row.get("Item", row.get("單位名稱", "")))
                 diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
-                try: diff = float(diff_str) / 100000000.0
+                
+                try: diff = float(diff_str) / 100000000.0 # 官方數據單位是元，需除以一億
                 except: diff = 0.0
                 
                 if "外資及陸資(不含外資自營商)" in name or "外資自營商" in name:
@@ -78,15 +57,35 @@ def get_institutional_data():
                     has_data = True
                     
             if has_data:
-                # ✅ 改為保留小數點後兩位
                 return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception as e:
-        print(f"OpenAPI 備用引擎抓取失敗: {e}")
+        print(f"官方 OpenAPI 抓取失敗: {e}，正在切換 Yahoo 備用引擎...")
+
+    # === 🛡️ 備用引擎 2：Yahoo 股市 (表頭錨點法) ===
+    try:
+        url = "https://tw.stock.yahoo.com/institutional-trading"
+        res = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        strings = list(soup.stripped_strings)
+        
+        for i in range(len(strings) - 4):
+            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
+                for j in range(i+4, i+20):
+                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
+                        try:
+                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
+                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
+                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
+                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
+                        except ValueError:
+                            break
+    except Exception as e:
+        print(f"Yahoo 備用引擎抓取失敗: {e}")
 
     return None, None, None
 
 def calculate_technical_indicators(df):
-    """計算 RSI, KD, MACD"""
+    """計算 RSI, KD, MACD，並具備防崩潰機制"""
     if df.empty or len(df) < 20: 
         for col in ['RSI', 'K', 'D', 'MACD', 'Signal', 'Hist', 'MA20']:
             df[col] = 50.0 if col in ['RSI', 'K', 'D'] else df['Close']
@@ -147,7 +146,7 @@ def generate_market_text():
     elif pct_tw > pct_otc and pct_tw > 0:
         market_style = "【外資控盤，拉抬權值股】大盤漲幅勝過櫃買，資金集中在台積電等大型權值股，中小型股可能面臨資金排擠效應 (拉積盤)。"
     elif pct_otc < 0 and pct_tw < 0:
-        market_style = f"【泥沙俱下，系統性風險】大盤與櫃買同步下跌，市場恐慌情緒蔓延，請嚴控資金水位，多看少做。"
+        market_style = "【泥沙俱下，系統性風險】大盤與櫃買同步下跌，市場恐慌情緒蔓延，請嚴控資金水位，多看少做。"
     else:
         market_style = "【資金輪動，多空震盪】大盤與櫃買走勢分歧，市場處於資金轉換期，建議挑選強勢族群，縮短操作週期。"
 
@@ -158,7 +157,6 @@ def generate_market_text():
     # --- 2. 三大法人 ---
     if foreign is not None:
         total_net = foreign + trust + dealer
-        # ✅ 使用 +.2f 強制顯示小數點後兩位，沒有的會自動補 0
         inst_text = (f"今日三大法人合計：**{total_net:+.2f} 億元**\n"
                      f"> • **外資**：`{foreign:+.2f} 億` ｜ **投信**：`{trust:+.2f} 億` ｜ **自營**：`{dealer:+.2f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
@@ -204,7 +202,7 @@ async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
     data = await asyncio.to_thread(generate_market_text) 
     if not data:
-        await msg.edit(content="⚠️ 資料抓取失敗，請檢查 Yahoo Finance 報價源。")
+        await msg.edit(content="⚠️ 資料抓取失敗，請檢查報價源連線。")
         return
         
     kline, inst, tech, intl, eval_text = data
@@ -243,7 +241,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(小數點 2 位精準版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載官方 OpenAPI 第一引擎)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
