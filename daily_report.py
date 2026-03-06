@@ -30,44 +30,40 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_yahoo_tw_indices():
-    """【真・即時引擎】直接暴力解析 Yahoo 台灣首頁，抓取與網頁 100% 同步的加權與櫃買指數"""
-    url = "https://tw.stock.yahoo.com/"
+def get_realtime_index(ticker):
+    """【絕對精準引擎】直接進入專屬報價頁面，鎖定特大號字體抓取最新數字"""
+    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    results = {"^TWII": (None, None), "^TWOII": (None, None)}
     
     try:
         res = requests.get(url, headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        targets = {"加權指數": "^TWII", "櫃買指數": "^TWOII"}
+        # 1. 抓取大字體的最新價格 (Yahoo 報價頁面的現價固定帶有 Fz(32px) 類別)
+        price_tag = soup.find('span', class_=re.compile(r'Fz\(32px\)'))
+        if not price_tag:
+            return None, None
+            
+        price = float(price_tag.text.replace(',', ''))
         
-        for name, ticker in targets.items():
-            # 尋找首頁最上方的指數名稱
-            elem = soup.find(string=re.compile(name))
-            if elem:
-                parent = elem.find_parent('a')
-                if parent:
-                    texts = list(parent.stripped_strings)
-                    price, pct = None, None
-                    for t in texts:
-                        # 找尋價格格式 (例如 33,600.00 或 306.49)
-                        if re.match(r'^\d{1,3}(,\d{3})*\.\d+$', t) or re.match(r'^\d+\.\d+$', t):
-                            if price is None:
-                                price = float(t.replace(',', ''))
-                        # 找尋漲跌幅格式 (例如 (+0.75%) 或 ▼0.22%)
-                        if '%' in t:
-                            pct_str = t.replace('(', '').replace(')', '').replace('%', '').replace('+', '').replace(',', '')
-                            pct_str = pct_str.replace('▼', '-').replace('▲', '').replace('▽', '-').replace('△', '')
-                            try:
-                                pct = float(pct_str)
-                            except:
-                                pass
-                    results[ticker] = (price, pct)
+        # 2. 抓取漲跌幅 (鎖定價格旁邊同一個區塊裡的 % 符號)
+        pct = 0.0
+        container = price_tag.parent.parent # 往上找父容器
+        for item in container.stripped_strings:
+            if '%' in item:
+                # 把 (+0.75%) 或是 ▼0.22% 清洗成純數字
+                txt = item.replace('(', '').replace(')', '').replace('%', '').replace('+', '').replace(',', '')
+                txt = txt.replace('▼', '-').replace('▲', '').replace('▽', '-').replace('△', '')
+                try:
+                    pct = float(txt)
+                    break
+                except ValueError:
+                    continue
+                    
+        return price, pct
     except Exception as e:
-        print(f"Yahoo TW 首頁指數抓取失敗: {e}")
-        
-    return results
+        print(f"專屬頁面抓取失敗 {ticker}: {e}")
+        return None, None
 
 def get_institutional_data():
     """終極雙引擎：優先使用證交所 OpenAPI (最快最準)，失敗才切換 Yahoo 備用"""
@@ -170,24 +166,22 @@ def generate_market_text():
     if twii.empty or sp500.empty or vix.empty: return None
 
     twii = calculate_technical_indicators(twii)
-    # yfinance 的 otc 已經壞死，我們只拿它來做防止當機的填充物
+    # yfinance 的 otc 已殘廢，僅做防呆填充
     otc = calculate_technical_indicators(otc)
     
     c_twii, p_twii = twii.iloc[-1], twii.iloc[-2]
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    # === 👉 關鍵修正：透過 Yahoo 台灣首頁強制抓取零延遲即時指數 ===
-    rt_indices = get_yahoo_tw_indices()
-    twii_rt_price, twii_rt_pct = rt_indices["^TWII"]
-    otc_rt_price, otc_rt_pct = rt_indices["^TWOII"]
+    # === 👉 關鍵修正：透過 Yahoo 專屬報價頁面抓取零延遲即時指數 ===
+    twii_rt_price, twii_rt_pct = get_realtime_index("^TWII")
+    otc_rt_price, otc_rt_pct = get_realtime_index("^TWOII")
 
-    # 如果首頁爬蟲成功，則採用絕對準確的數據；否則退回歷史數據
-    c_tw_price = twii_rt_price if twii_rt_price else c_twii['Close']
+    # 如果爬蟲成功，優先採用爬出來的精準數字；否則才用 yfinance 歷史數據墊底
+    c_tw_price = twii_rt_price if twii_rt_price is not None else c_twii['Close']
     pct_tw = twii_rt_pct if twii_rt_pct is not None else ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
 
-    # 櫃買全面捨棄 yfinance，直接吃網頁真實數據 (若失敗給預設值防呆)
-    c_otc_price = otc_rt_price if otc_rt_price else (otc.iloc[-1]['Close'] if not otc.empty else 0)
+    c_otc_price = otc_rt_price if otc_rt_price is not None else (otc.iloc[-1]['Close'] if not otc.empty else 0)
     pct_otc = otc_rt_pct if otc_rt_pct is not None else 0.0
 
     # --- 1. 加權 vs 櫃買 ---
