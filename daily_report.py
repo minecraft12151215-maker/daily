@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
-# 隱藏並忽略所有的 SSL 憑證警告 (無敵模式)
+# 隱藏並忽略所有的 SSL 憑證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 載入環境變數
@@ -30,46 +30,76 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_realtime_index(ticker):
-    """【絕對精準引擎】直接進入專屬報價頁面，鎖定特大號字體抓取最新數字"""
-    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+def get_realtime_indices():
+    """【終極直連引擎】直連台灣證交所官方 MIS 系統，徹底避開壞掉的 Yahoo 全球資料庫"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    results = {"twii": (None, None), "otc": (None, None)}
     
+    # === 🚀 主力引擎 1：證交所 MIS 即時系統 (最準確，券商資料源) ===
     try:
-        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        url = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw|otc_o00.tw"
+        session = requests.Session()
+        # 必須先敲首頁取得 Cookie
+        session.get("https://mis.twse.com.tw/stock/index.jsp", headers=headers, timeout=5)
+        res = session.get(url, headers=headers, timeout=10)
+        data = res.json()
+        
+        for item in data.get('msgArray', []):
+            c = item.get('c')
+            z = item.get('z') # 當前價
+            y = item.get('y') # 昨收
+            
+            # 若 z 為 '-' 代表盤前或尚未有成交，使用昨收價
+            if not z or z == '-': 
+                z = y 
+                
+            curr = float(z.replace(',', ''))
+            prev = float(y.replace(',', ''))
+            pct = round(((curr - prev) / prev) * 100, 2)
+            
+            if c == 't00': results["twii"] = (curr, pct)
+            elif c == 'o00': results["otc"] = (curr, pct)
+                
+        if results["twii"][0] and results["otc"][0]:
+            print("✅ 成功使用官方 MIS API 獲取指數")
+            return results
+    except Exception as e:
+        print(f"⚠️ MIS API 失敗: {e}，切換 Yahoo 備用方案...")
+
+    # === 🛡️ 備用引擎 2：Yahoo 首頁導航列解析 (只看畫面上顯示的字，防堵 API 壞掉) ===
+    try:
+        res = requests.get("https://tw.stock.yahoo.com/", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 1. 抓取大字體的最新價格 (Yahoo 報價頁面的現價固定帶有 Fz(32px) 類別)
-        price_tag = soup.find('span', class_=re.compile(r'Fz\(32px\)'))
-        if not price_tag:
-            return None, None
-            
-        price = float(price_tag.text.replace(',', ''))
-        
-        # 2. 抓取漲跌幅 (鎖定價格旁邊同一個區塊裡的 % 符號)
-        pct = 0.0
-        container = price_tag.parent.parent # 往上找父容器
-        for item in container.stripped_strings:
-            if '%' in item:
-                # 把 (+0.75%) 或是 ▼0.22% 清洗成純數字
-                txt = item.replace('(', '').replace(')', '').replace('%', '').replace('+', '').replace(',', '')
-                txt = txt.replace('▼', '-').replace('▲', '').replace('▽', '-').replace('△', '')
-                try:
-                    pct = float(txt)
-                    break
-                except ValueError:
-                    continue
+        for a in soup.find_all('a', href=True):
+            if '/market/tse' in a['href'] or '/market/tpex' in a['href']:
+                texts = list(a.stripped_strings)
+                price, pct = None, None
+                for t in texts:
+                    if re.match(r'^\d{1,3}(,\d{3})*\.\d+$', t) or re.match(r'^\d+\.\d+$', t):
+                        if price is None: price = float(t.replace(',', ''))
+                    if '%' in t:
+                        pct_str = t.replace('(', '').replace(')', '').replace('%', '').replace('+', '').replace(',', '').replace('▼', '-').replace('▲', '').replace('▽', '-').replace('△', '')
+                        try: pct = float(pct_str)
+                        except: pass
+                
+                if '/market/tse' in a['href'] and price is not None:
+                    results['twii'] = (price, pct)
+                elif '/market/tpex' in a['href'] and price is not None:
+                    results['otc'] = (price, pct)
                     
-        return price, pct
+        print("✅ 成功使用 Yahoo Navbar 獲取指數")
     except Exception as e:
-        print(f"專屬頁面抓取失敗 {ticker}: {e}")
-        return None, None
+        print(f"⚠️ Yahoo Navbar 解析失敗: {e}")
+        
+    return results
 
 def get_institutional_data():
-    """終極雙引擎：優先使用證交所 OpenAPI (最快最準)，失敗才切換 Yahoo 備用"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # === 🚀 主力引擎 1：證交所 OpenAPI (官方來源，保證不延遲) ===
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
         res = requests.get(open_url, headers=headers, verify=False, timeout=10)
@@ -82,7 +112,7 @@ def get_institutional_data():
                 name = str(row.get("Item", row.get("單位名稱", "")))
                 diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
                 
-                try: diff = float(diff_str) / 100000000.0 # 官方數據單位是元，需除以一億
+                try: diff = float(diff_str) / 100000000.0 
                 except: diff = 0.0
                 
                 if "外資及陸資(不含外資自營商)" in name or "外資自營商" in name:
@@ -98,9 +128,8 @@ def get_institutional_data():
             if has_data:
                 return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception as e:
-        print(f"官方 OpenAPI 抓取失敗: {e}，正在切換 Yahoo 備用引擎...")
+        pass
 
-    # === 🛡️ 備用引擎 2：Yahoo 股市 (表頭錨點法) ===
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
         res = requests.get(url, headers=headers, verify=False, timeout=10)
@@ -119,12 +148,11 @@ def get_institutional_data():
                         except ValueError:
                             break
     except Exception as e:
-        print(f"Yahoo 備用引擎抓取失敗: {e}")
+        pass
 
     return None, None, None
 
 def calculate_technical_indicators(df):
-    """計算 RSI, KD, MACD，並具備防崩潰機制"""
     if df.empty or len(df) < 20: 
         for col in ['RSI', 'K', 'D', 'MACD', 'Signal', 'Hist', 'MA20']:
             df[col] = 50.0 if col in ['RSI', 'K', 'D'] else df.get('Close', 0)
@@ -154,30 +182,33 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    """自動抓取五大區塊並生成分析文字"""
     print("🔄 正在抓取雙引擎大盤與國際資料...")
     
     twii = yf.Ticker("^TWII").history(period="3mo")
-    otc = yf.Ticker("^TWOII").history(period="3mo")
+    otc = yf.Ticker("^TWOII").history(period="3mo") # Yahoo 全球櫃買資料庫已死，此行僅供維持 DataFrame 結構
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
     vix = yf.Ticker("^VIX").history(period="1mo")
     foreign, trust, dealer = get_institutional_data()
 
     if twii.empty or sp500.empty or vix.empty: return None
 
+    # === 👉 關鍵修正：透過官方 MIS API 強制抓取零延遲即時指數 ===
+    rt_indices = get_realtime_indices()
+    twii_rt_price, twii_rt_pct = rt_indices["twii"]
+    otc_rt_price, otc_rt_pct = rt_indices["otc"]
+
+    # 將即時價格覆蓋回去，確保技術指標 (MA, RSI) 算的是最新價格
+    if twii_rt_price:
+        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
+        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
+        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
+
     twii = calculate_technical_indicators(twii)
-    # yfinance 的 otc 已殘廢，僅做防呆填充
-    otc = calculate_technical_indicators(otc)
     
     c_twii, p_twii = twii.iloc[-1], twii.iloc[-2]
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    # === 👉 關鍵修正：透過 Yahoo 專屬報價頁面抓取零延遲即時指數 ===
-    twii_rt_price, twii_rt_pct = get_realtime_index("^TWII")
-    otc_rt_price, otc_rt_pct = get_realtime_index("^TWOII")
-
-    # 如果爬蟲成功，優先採用爬出來的精準數字；否則才用 yfinance 歷史數據墊底
     c_tw_price = twii_rt_price if twii_rt_price is not None else c_twii['Close']
     pct_tw = twii_rt_pct if twii_rt_pct is not None else ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
 
