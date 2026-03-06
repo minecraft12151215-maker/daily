@@ -12,10 +12,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
-# 隱藏並忽略所有的 SSL 憑證警告 (無敵模式)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# 載入環境變數
 load_dotenv()
 
 # ================= 絕對必填設定區 =================
@@ -30,64 +27,36 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_yahoo_indices_via_html():
-    """【終極純 Yahoo 引擎】放棄會擋 IP 的官方 API，直接地毯式搜索 Yahoo 台灣網頁"""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    results = {"twii": (None, None), "otc": (None, None)}
-    
-    # 鎖定 Yahoo 台灣的上市與上櫃專屬頁面
-    targets = {
-        "twii": ("https://tw.stock.yahoo.com/market/tse", ["加權指數"]),
-        "otc": ("https://tw.stock.yahoo.com/market/tpex", ["櫃檯指數", "櫃買指數", "加權指數"]) # 櫃買專頁有時會顯示成加權指數
+def get_cnyes_indices():
+    """【真・神級解法】改用鉅亨網 (cnYES) API，無懼雲端 IP 封鎖，直接回傳乾淨 JSON"""
+    url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://invest.cnyes.com",
+        "Referer": "https://invest.cnyes.com/"
     }
-    
-    for key, (url, keywords) in targets.items():
-        try:
-            res = requests.get(url, headers=headers, verify=False, timeout=15)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            # 將網頁所有文字抽出來，變成一個乾淨的文字陣列
-            texts = list(soup.stripped_strings)
-            
-            price, pct = None, None
-            
-            for i, t in enumerate(texts):
-                # 如果找到目標關鍵字 (例如 "櫃檯指數")
-                if any(kw in t for kw in keywords):
-                    # 往後掃描 15 個文字塊，尋找價格和漲跌幅
-                    for j, st in enumerate(texts[i+1 : i+15]):
-                        clean_st = st.replace(',', '')
-                        
-                        # 1. 找價格 (特徵：有小數點的數字，且通常大於 100 以排除漲跌點數)
-                        if price is None and re.match(r'^\d+\.\d{2}$', clean_st):
-                            temp_price = float(clean_st)
-                            if temp_price > 100: 
-                                price = temp_price
-                                
-                        # 2. 找漲跌幅 (特徵：包含 %)
-                        elif price is not None and '%' in st:
-                            # 清洗各種奇怪的箭頭和加減號
-                            pct_str = st.replace('%', '').replace('+', '').replace('▼', '-').replace('▲', '').replace('▽', '-').replace('△', '').strip()
-                            
-                            # 如果 % 是獨立的一個字元，代表數字被切到前一個字串了
-                            if pct_str == '':
-                                pct_str = texts[i+1+j-1].replace('+', '').replace('▼', '-').replace('▲', '').strip()
-                            
-                            try:
-                                pct = float(pct_str)
-                                break
-                            except:
-                                pass
-                                
-                    if price is not None and pct is not None:
-                        results[key] = (price, pct)
-                        break # 成功找到，跳出迴圈
-        except Exception as e:
-            print(f"Yahoo {key} 抓取失敗: {e}")
-            
+    results = {"twii": (None, None), "otc": (None, None)}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        if data.get("statusCode") == 200:
+            for item in data['items']['data']:
+                symbol = item.get("symbol", "")
+                price = float(item.get("c", 0))
+                pct = float(item.get("net_change_percentage", 0))
+                
+                if "TSE01" in symbol:
+                    results["twii"] = (price, pct)
+                elif "OTC01" in symbol:
+                    results["otc"] = (price, pct)
+            print("✅ 成功使用鉅亨網 API 獲取最新指數！")
+    except Exception as e:
+        print(f"⚠️ 鉅亨網 API 失敗: {e}")
+        
     return results
 
 def get_institutional_data():
-    """【純 Yahoo 引擎】從 Yahoo 股市抓取三大法人買賣超 (避開證交所阻擋雲端 IP 的問題)"""
+    """法人資料：保留已經在你的主機上運作成功的 Yahoo 爬蟲"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
@@ -112,7 +81,6 @@ def get_institutional_data():
     return None, None, None
 
 def calculate_technical_indicators(df):
-    """計算 RSI, KD, MACD，並具備防崩潰機制"""
     if df.empty or len(df) < 20: 
         for col in ['RSI', 'K', 'D', 'MACD', 'Signal', 'Hist', 'MA20']:
             df[col] = 50.0 if col in ['RSI', 'K', 'D'] else df.get('Close', 0)
@@ -142,43 +110,37 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    """自動抓取五大區塊並生成分析文字"""
-    print("🔄 正在抓取雙引擎大盤與國際資料...")
+    print("🔄 正在抓取大盤與國際資料...")
     
     twii = yf.Ticker("^TWII").history(period="3mo")
-    otc = yf.Ticker("^TWOII").history(period="3mo") # 僅做為資料結構防呆填充
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
     vix = yf.Ticker("^VIX").history(period="1mo")
     
-    # 全面改用 Yahoo 抓取法人資料，避開雲端 IP 被擋的問題
     foreign, trust, dealer = get_institutional_data()
 
     if twii.empty or sp500.empty or vix.empty: return None
 
-    # === 👉 關鍵修正：透過 Yahoo HTML 文字地毯式搜索抓取最新指數 ===
-    rt_indices = get_yahoo_indices_via_html()
+    # === 👉 終極修正：直接使用鉅亨網 API，徹底捨棄會出現 304.21 的 yfinance 櫃買資料 ===
+    rt_indices = get_cnyes_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 將即時價格覆蓋回去歷史數據，確保技術指標 (MA, RSI) 算的是最新價格
     if twii_rt_price:
         twii.loc[twii.index[-1], 'Close'] = twii_rt_price
         twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
         twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
 
     twii = calculate_technical_indicators(twii)
-    # 拋棄 yfinance 壞掉的 OTC 資料
-    otc = calculate_technical_indicators(otc)
     
     c_twii, p_twii = twii.iloc[-1], twii.iloc[-2]
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    # 如果爬蟲成功，優先採用我們辛苦爬出來的精準數字
     c_tw_price = twii_rt_price if twii_rt_price is not None else c_twii['Close']
     pct_tw = twii_rt_pct if twii_rt_pct is not None else ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
 
-    c_otc_price = otc_rt_price if otc_rt_price is not None else (otc.iloc[-1]['Close'] if not otc.empty else 0)
+    # 絕對不允許退回 yfinance 的 304.21
+    c_otc_price = otc_rt_price if otc_rt_price is not None else 0.0
     pct_otc = otc_rt_pct if otc_rt_pct is not None else 0.0
 
     # --- 1. 加權 vs 櫃買 ---
@@ -285,7 +247,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載 Yahoo 台灣特化引擎)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載神級鉅亨網 API)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
