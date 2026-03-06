@@ -10,6 +10,10 @@ import os
 import re
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import urllib3
+
+# 隱藏並忽略所有的 SSL 憑證警告 (無敵模式)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 載入環境變數
 load_dotenv()
@@ -26,6 +30,23 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+def get_realtime_quote(ticker):
+    """【即時引擎】透過 Yahoo 底層 API 強制抓取零延遲的最新報價"""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?region=TW&lang=zh-Hant-TW"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        meta = res.json()['chart']['result'][0]['meta']
+        price = meta['regularMarketPrice']
+        # 確保抓到準確的昨收價
+        prev = meta.get('chartPreviousClose', meta.get('previousClose', price))
+        if prev == 0: prev = price
+        pct = ((price - prev) / prev) * 100
+        return price, pct
+    except Exception as e:
+        print(f"即時報價抓取失敗 {ticker}: {e}")
+        return None, None
+
 def get_institutional_data():
     """終極雙引擎：優先使用證交所 OpenAPI (最快最準)，失敗才切換 Yahoo 備用"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -33,7 +54,7 @@ def get_institutional_data():
     # === 🚀 主力引擎 1：證交所 OpenAPI (官方來源，保證不延遲) ===
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
-        res = requests.get(open_url, headers=headers, timeout=10)
+        res = requests.get(open_url, headers=headers, verify=False, timeout=10)
         if res.status_code == 200:
             data = res.json()
             f_val = t_val = d_val = 0.0
@@ -64,7 +85,7 @@ def get_institutional_data():
     # === 🛡️ 備用引擎 2：Yahoo 股市 (表頭錨點法) ===
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         strings = list(soup.stripped_strings)
         
@@ -134,10 +155,18 @@ def generate_market_text():
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
+    # === 👉 關鍵修正：透過 Yahoo 底層 API 強制抓取零延遲即時指數 ===
+    twii_rt_price, twii_rt_pct = get_realtime_quote("^TWII")
+    otc_rt_price, otc_rt_pct = get_realtime_quote("^TWOII")
+
+    # 如果即時 API 成功，則採用絕對準確的數據；否則退回歷史數據
+    c_tw_price = twii_rt_price if twii_rt_price else c_twii['Close']
+    pct_tw = twii_rt_pct if twii_rt_pct else ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
+
+    c_otc_price = otc_rt_price if otc_rt_price else c_otc['Close']
+    pct_otc = otc_rt_pct if otc_rt_pct else ((c_otc['Close'] - p_otc['Close']) / p_otc['Close']) * 100
+
     # --- 1. 加權 vs 櫃買 ---
-    pct_tw = ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
-    pct_otc = ((c_otc['Close'] - p_otc['Close']) / p_otc['Close']) * 100
-    
     tw_icon = "🔴" if pct_tw > 0 else "🟢"
     otc_icon = "🔴" if pct_otc > 0 else "🟢"
     
@@ -150,8 +179,8 @@ def generate_market_text():
     else:
         market_style = "【資金輪動，多空震盪】大盤與櫃買走勢分歧，市場處於資金轉換期，建議挑選強勢族群，縮短操作週期。"
 
-    kline_text = (f"• **加權指數 (大型股)**：`{c_twii['Close']:,.0f}` 點 ({tw_icon} {pct_tw:+.2f}%)\n"
-                  f"• **櫃買指數 (中小型)**：`{c_otc['Close']:,.2f}` 點 ({otc_icon} {pct_otc:+.2f}%)\n"
+    kline_text = (f"• **加權指數 (大型股)**：`{c_tw_price:,.0f}` 點 ({tw_icon} {pct_tw:+.2f}%)\n"
+                  f"• **櫃買指數 (中小型)**：`{c_otc_price:,.2f}` 點 ({otc_icon} {pct_otc:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
 
     # --- 2. 三大法人 ---
@@ -161,7 +190,7 @@ def generate_market_text():
                      f"> • **外資**：`{foreign:+.2f} 億` ｜ **投信**：`{trust:+.2f} 億` ｜ **自營**：`{dealer:+.2f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
     else:
-        inst_text = "今日證交所法人數據尚未更新 (或逢假日休市)。"
+        inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
     # --- 3. 大盤技術指標 ---
     rsi = c_twii.get('RSI', 50.0)
@@ -183,12 +212,12 @@ def generate_market_text():
                  f"華爾街 VIX 恐慌指數目前來到 **{c_vix['Close']:.2f}** ({vix_trend})。\n"
                  f"> 總經視野：{'VIX回落顯示外資避險情緒降溫，有利資金動能' if vix_trend == '下降' else '恐慌情緒升溫，外資可能加速提款'}。")
 
-    # --- 5. 實戰操盤策略 ---
+    # --- 5. 實戰操盤策略 (採用最即時的價格來比對均線) ---
     support = twii['Low'].tail(10).min() 
     resistance = twii['High'].tail(10).max() 
-    ma20 = c_twii.get('MA20', c_twii['Close'])
+    ma20 = c_twii.get('MA20', c_tw_price)
     
-    if c_twii['Close'] > ma20:
+    if c_tw_price > ma20:
         adv = "大盤穩居月線之上，屬於多頭格局。配合櫃買強弱，可積極在底部起漲的強勢族群中尋找機會。"
     else:
         adv = "大盤跌破月線，趨勢偏弱。建議提高現金水位，嚴格設定防守價，並以短進短出為主。"
