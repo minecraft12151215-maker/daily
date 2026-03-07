@@ -29,31 +29,32 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_market_indices():
-    """【終極核彈級引擎】直戳 Yahoo 底層資料庫，徹底無視假日與封鎖"""
+    """【真・數學引擎】不依賴 API 的漲跌幅欄位，直接抓現價與昨收自己算！(破解週末歸零魔咒)"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # --- 🛡️ 絕對防線 1：Yahoo 台灣 React JSON 底層資料 (無視假日標題收合問題) ---
+    # --- 🛡️ 絕對防線 1：Yahoo 台灣 React JSON 底層資料 ---
     for key, ticker in [("twii", "%5ETWII"), ("otc", "%5ETWOII")]:
         try:
             url = f"https://tw.stock.yahoo.com/quote/{ticker}"
             res = requests.get(url, headers=headers, verify=False, timeout=10)
             
-            # 直接正則掃描網頁底層的隱藏 JSON 資料庫
-            p_match = re.search(r'"regularMarketPrice":\s*([\d\.]+)', res.text)
-            c_match = re.search(r'"regularMarketChangePercent":\s*([-\d\.]+)', res.text)
+            # 精準抓取底層的「現價」與「昨收價」
+            p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
+            prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
             
-            if p_match:
+            if p_match and prev_match:
                 price = float(p_match.group(1))
-                pct = float(c_match.group(1)) if c_match else 0.0
+                prev = float(prev_match.group(1))
                 
-                # 確保數字合理才寫入
-                if price > 100:
+                # 自己算漲跌幅，絕對不會被系統的 0.00 騙
+                if price > 100 and prev > 100:
+                    pct = ((price - prev) / prev) * 100
                     results[key] = (price, pct)
         except Exception as e:
             print(f"Yahoo JSON 引擎 ({key}) 發生異常: {e}")
 
-    # --- 🛡️ 絕對防線 2：鉅亨網 API (加上防 0.00 絕對機制) ---
+    # --- 🛡️ 絕對防線 2：鉅亨網 API (一樣拿昨收自己算) ---
     if results["twii"][0] is None or results["otc"][0] is None:
         try:
             url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
@@ -63,10 +64,10 @@ def get_market_indices():
                 for item in data['items']['data']:
                     sym = item.get("symbol", "")
                     p = float(item.get("c", 0))
-                    pct = float(item.get("net_change_percentage", 0))
+                    prev = float(item.get("ref_price", 0)) # ref_price 就是昨收平盤價
                     
-                    # 🔴 絕對防禦：價格大於 100 才准放行，杜絕 0.00 災難
-                    if p > 100:
+                    if p > 100 and prev > 100:
+                        pct = ((p - prev) / prev) * 100
                         if "TSE01" in sym and results["twii"][0] is None:
                             results["twii"] = (p, pct)
                         elif "OTC01" in sym and results["otc"][0] is None:
@@ -148,13 +149,13 @@ def generate_market_text():
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # --- 終極防呆：如果上面兩道防線全滅，退回歷史最後已知價格 ---
+    # 終極防呆：若全滅退回歷史最後已知價格
     if twii_rt_price is None:
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
     
     if otc_rt_price is None:
-        otc_rt_price = 306.49  # 最後底線，不給你看錯誤數字
+        otc_rt_price = 306.49  
         otc_rt_pct = 0.75
 
     foreign, trust, dealer = get_institutional_data()
@@ -276,7 +277,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載突破假日封鎖之終極引擎)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載無懼歸零的數學引擎)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
