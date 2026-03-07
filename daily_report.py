@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
+# 隱藏憑證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
@@ -27,36 +28,41 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_cnyes_indices():
-    """【真・神級解法】改用鉅亨網 (cnYES) API，無懼雲端 IP 封鎖，直接回傳乾淨 JSON"""
-    url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": "https://invest.cnyes.com",
-        "Referer": "https://invest.cnyes.com/"
-    }
-    results = {"twii": (None, None), "otc": (None, None)}
+def get_yahoo_quote(ticker):
+    """【純血 Yahoo 引擎】直接讀取 Yahoo 專屬報價頁面的網頁標題，保證與畫面 100% 同步"""
+    url = f"https://tw.stock.yahoo.com/quote/{ticker}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
     try:
-        res = requests.get(url, headers=headers, timeout=10)
-        data = res.json()
-        if data.get("statusCode") == 200:
-            for item in data['items']['data']:
-                symbol = item.get("symbol", "")
-                price = float(item.get("c", 0))
-                pct = float(item.get("net_change_percentage", 0))
-                
-                if "TSE01" in symbol:
-                    results["twii"] = (price, pct)
-                elif "OTC01" in symbol:
-                    results["otc"] = (price, pct)
-            print("✅ 成功使用鉅亨網 API 獲取最新指數！")
-    except Exception as e:
-        print(f"⚠️ 鉅亨網 API 失敗: {e}")
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
         
-    return results
+        # 直接抓取網頁的 <title> 標籤 (例如: "櫃買指數 (^TWOII) 306.49 漲跌幅 +0.75% - Yahoo奇摩股市")
+        title = soup.find('title').text
+        
+        price, pct = None, None
+        
+        # 1. 抓取價格 (尋找括號後面的數字)
+        p_match = re.search(r'\)\s*([0-9,]+\.\d+)', title)
+        if p_match:
+            price = float(p_match.group(1).replace(',', ''))
+            
+        # 2. 抓取漲跌幅 (尋找 % 前面的數字與符號)
+        pct_match = re.search(r'([-+▽△▼▲]*[0-9,]+\.\d+)%', title)
+        if pct_match:
+            pct_str = pct_match.group(1).replace('▼', '-').replace('▽', '-').replace('▲', '').replace('△', '').replace('+', '')
+            pct = float(pct_str)
+            
+        if price is not None and pct is not None:
+            return price, pct
+            
+    except Exception as e:
+        print(f"Yahoo {ticker} 抓取失敗: {e}")
+        
+    return None, None
 
 def get_institutional_data():
-    """法人資料：保留已經在你的主機上運作成功的 Yahoo 爬蟲"""
+    """【純血 Yahoo 引擎】從 Yahoo 股市抓取三大法人買賣超"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
@@ -110,7 +116,7 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    print("🔄 正在抓取大盤與國際資料...")
+    print("🔄 正在透過純 Yahoo 引擎抓取資料...")
     
     twii = yf.Ticker("^TWII").history(period="3mo")
     sp500 = yf.Ticker("^GSPC").history(period="1mo")
@@ -118,30 +124,32 @@ def generate_market_text():
     
     foreign, trust, dealer = get_institutional_data()
 
-    if twii.empty or sp500.empty or vix.empty: return None
+    if twii.empty or sp500.empty or vix.empty: 
+        return None
 
-    # === 👉 終極修正：直接使用鉅亨網 API，徹底捨棄會出現 304.21 的 yfinance 櫃買資料 ===
-    rt_indices = get_cnyes_indices()
-    twii_rt_price, twii_rt_pct = rt_indices["twii"]
-    otc_rt_price, otc_rt_pct = rt_indices["otc"]
+    # === 👉 關鍵修正：完全使用 Yahoo 抓取最新指數，徹底捨棄其他 API 與防呆的 0.00 ===
+    twii_rt_price, twii_rt_pct = get_yahoo_quote("^TWII")
+    otc_rt_price, otc_rt_pct = get_yahoo_quote("^TWOII")
 
-    if twii_rt_price:
-        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
-        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
-        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
+    # 如果抓不到，終止回傳，避免顯示錯誤的數字
+    if twii_rt_price is None or otc_rt_price is None:
+        return None
+
+    # 將最新的精準價格塞進歷史資料表，確保計算技術指標時是準確的
+    twii.loc[twii.index[-1], 'Close'] = twii_rt_price
+    twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
+    twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
-    c_twii, p_twii = twii.iloc[-1], twii.iloc[-2]
     c_sp, p_sp = sp500.iloc[-1], sp500.iloc[-2]
     c_vix, p_vix = vix.iloc[-1], vix.iloc[-2]
 
-    c_tw_price = twii_rt_price if twii_rt_price is not None else c_twii['Close']
-    pct_tw = twii_rt_pct if twii_rt_pct is not None else ((c_twii['Close'] - p_twii['Close']) / p_twii['Close']) * 100
+    c_tw_price = twii_rt_price
+    pct_tw = twii_rt_pct
 
-    # 絕對不允許退回 yfinance 的 304.21
-    c_otc_price = otc_rt_price if otc_rt_price is not None else 0.0
-    pct_otc = otc_rt_pct if otc_rt_pct is not None else 0.0
+    c_otc_price = otc_rt_price
+    pct_otc = otc_rt_pct
 
     # --- 1. 加權 vs 櫃買 ---
     tw_icon = "🔴" if pct_tw > 0 else "🟢"
@@ -170,17 +178,17 @@ def generate_market_text():
         inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
     # --- 3. 大盤技術指標 ---
-    rsi = c_twii.get('RSI', 50.0)
-    k = c_twii.get('K', 50.0)
-    d = c_twii.get('D', 50.0)
-    macd_hist = c_twii.get('Hist', 0.0)
-    p_macd_hist = p_twii.get('Hist', 0.0)
+    rsi = twii.iloc[-1].get('RSI', 50.0)
+    k = twii.iloc[-1].get('K', 50.0)
+    d = twii.iloc[-1].get('D', 50.0)
+    macd_hist = twii.iloc[-1].get('Hist', 0.0)
+    p_macd_hist = twii.iloc[-2].get('Hist', 0.0)
     
     rsi_desc = "⚠️ 過熱警報 (隨時面臨修正)" if rsi > 75 else "🟢 落底反彈 (超賣區浮現買點)" if rsi < 30 else "🟡 中性震盪"
     macd_trend = "紅柱擴大，多頭動能強勁" if macd_hist > 0 and macd_hist > p_macd_hist else "紅柱縮減，多方力竭" if macd_hist > 0 else "綠柱縮減，空方力道衰退" if macd_hist < p_macd_hist else "綠柱擴大，空方主導"
     
     tech_text = (f"• **RSI (14)**：`{rsi:.1f}` ｜ {rsi_desc}\n"
-                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and p_twii.get('K', 50)<p_twii.get('D', 50)) else '偏多格局' if k>d else '偏空格局'}\n"
+                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and twii.iloc[-2].get('K', 50)<twii.iloc[-2].get('D', 50)) else '偏多格局' if k>d else '偏空格局'}\n"
                  f"• **MACD 動能**：{macd_trend}")
 
     # --- 4. 國際總經與情緒 ---
@@ -192,7 +200,7 @@ def generate_market_text():
     # --- 5. 實戰操盤策略 ---
     support = twii['Low'].tail(10).min() 
     resistance = twii['High'].tail(10).max() 
-    ma20 = c_twii.get('MA20', c_tw_price)
+    ma20 = twii.iloc[-1].get('MA20', c_tw_price)
     
     if c_tw_price > ma20:
         adv = "大盤穩居月線之上，屬於多頭格局。配合櫃買強弱，可積極在底部起漲的強勢族群中尋找機會。"
@@ -208,7 +216,7 @@ async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
     data = await asyncio.to_thread(generate_market_text) 
     if not data:
-        await msg.edit(content="⚠️ 資料抓取失敗，請檢查報價源連線。")
+        await msg.edit(content="⚠️ Yahoo 資料抓取失敗，請稍後再試。")
         return
         
     kline, inst, tech, intl, eval_text = data
@@ -247,7 +255,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載神級鉅亨網 API)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載純血 Yahoo 標題解析器)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
