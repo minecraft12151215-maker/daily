@@ -26,48 +26,38 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_yahoo_realtime_indices():
-    """【完全聽令版】乖乖只抓 Yahoo，雙層防護保證抓到數字"""
+    """【終極聽令版】100% 只抓 Yahoo！直接讀取網頁分頁標題，無視任何網頁改版與 API 阻擋"""
     results = {"twii": (None, None), "otc": (None, None)}
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    tickers = {"twii": "^TWII", "otc": "^TWOII"} 
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # 防線 1：Yahoo 官方 Chart API
-    for key, ticker in tickers.items():
+    urls = {
+        "twii": "https://tw.stock.yahoo.com/quote/^TWII",
+        "otc": "https://tw.stock.yahoo.com/quote/^TWOII"
+    }
+    
+    for key, url in urls.items():
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
             res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                meta = data['chart']['result'][0]['meta']
-                price = meta['regularMarketPrice']
-                prev = meta['previousClose']
-                if price > 0 and prev > 0:
-                    pct = ((price - prev) / prev) * 100
-                    results[key] = (price, pct)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            
+            # 絕招：直接抓取網頁的 <title> 標籤
+            # 格式範例: "櫃檯買賣指數 (^TWOII) 288.96 -17.53 (-5.72%) - Yahoo奇摩股市"
+            title_text = soup.title.string if soup.title else ""
+            
+            # 用正規表達式精準剪下價格與漲跌幅
+            match = re.search(r'\)\s*([\d\.,]+)\s+[^\(]*\(([\+\-]?[\d\.,]+)%\)', title_text)
+            
+            if match:
+                price = float(match.group(1).replace(',', ''))
+                pct = float(match.group(2).replace(',', ''))
+                results[key] = (price, pct)
         except Exception:
             pass
-
-    # 防線 2：如果 API 沒抓到，直接暴力解剖 Yahoo 台灣網頁原始碼
-    urls = {"twii": "https://tw.stock.yahoo.com/quote/^TWII", "otc": "https://tw.stock.yahoo.com/quote/^TWOII"}
-    for key, url in urls.items():
-        if results[key][0] is None:
-            try:
-                res = requests.get(url, headers=headers, verify=False, timeout=5)
-                p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-                prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-                if p_match and prev_match:
-                    price = float(p_match.group(1))
-                    prev = float(prev_match.group(1))
-                    if price > 0 and prev > 0:
-                        pct = ((price - prev) / prev) * 100
-                        results[key] = (price, pct)
-            except Exception:
-                pass
-                
+            
     return results
 
 def get_institutional_data():
-    """三大法人：保留成功抓取 -1208 億的穩定版本"""
+    """三大法人：官方 OpenAPI 穩定版"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
@@ -131,14 +121,14 @@ def generate_market_text():
         twii = yf.Ticker("^TWII").history(period="3mo")
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
-        # 🔥 已徹底移除會導致當機的 yfinance 櫃買歷史資料抓取
+        # 🔥 已徹底移除所有櫃買 (OTC) 的 yfinance 歷史資料請求，絕不當機！
     except Exception as e:
         return {"error": f"資料庫異常: {e}"}
 
     if twii.empty: 
         return {"error": "無法取得大盤歷史資料。"}
 
-    # 抓取 Yahoo 即時報價
+    # 抓取 Yahoo 網頁標題即時報價
     rt_indices = get_yahoo_realtime_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
@@ -148,9 +138,8 @@ def generate_market_text():
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
     
-    # 萬一真的抓不到櫃買，直接回報，不再塞假數字
     if otc_rt_price is None:
-        return {"error": "Yahoo 報價伺服器暫時無法連線取得櫃買指數，請稍後再試。"}
+        return {"error": "無法從 Yahoo 網頁解析出櫃買指數，請稍後再試。"}
 
     foreign, trust, dealer = get_institutional_data()
 
@@ -267,7 +256,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(完美修復版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(暴力 Title 爬取版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
