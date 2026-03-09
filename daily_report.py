@@ -10,9 +10,7 @@ import os
 import re
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -25,67 +23,48 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_market_indices():
-    """【終極網頁標籤截取法】直接讀取 Yahoo 分頁標題，無視所有 API 延遲與網頁改版"""
+def get_realtime_indices():
+    """【穩定引擎】使用鉅亨網官方 API 直接抓取即時數字，不依賴網頁爬蟲"""
     results = {"twii": (None, None), "otc": (None, None)}
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    
-    urls = {
-        "twii": "https://tw.stock.yahoo.com/quote/^TWII",
-        "otc": "https://tw.stock.yahoo.com/quote/^TWOII"
-    }
-    
-    for key, url in urls.items():
-        try:
-            res = requests.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
-            # 直接抓取網頁的 <title> 標籤
-            # 格式範例: "櫃檯買賣指數 (^TWOII) 288.96 -17.53 (-5.72%) - Yahoo奇摩股市"
-            title_text = soup.title.string if soup.title else ""
-            
-            # 使用正規表達式，精準剪下價格與漲跌幅
-            match = re.search(r'\)\s*([\d\.,]+)\s+.*?\(([\+\-]?[\d\.]+)%\)', title_text)
-            
-            if match:
-                price = float(match.group(1).replace(',', ''))
-                pct = float(match.group(2))
-                results[key] = (price, pct)
-                print(f"✅ {key} 標籤截取成功: {price} ({pct}%)")
-        except Exception as e:
-            print(f"❌ {key} 標籤截取失敗: {e}")
-
+    try:
+        url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        for item in data.get('items', {}).get('data', []):
+            sym = item.get("symbol", "")
+            price = float(item.get("c", 0))
+            prev = float(item.get("ref_price", 0))
+            if price > 0 and prev > 0:
+                pct = ((price - prev) / prev) * 100
+                if "TSE01" in sym:
+                    results["twii"] = (price, pct)
+                elif "OTC01" in sym:
+                    results["otc"] = (price, pct)
+    except Exception as e:
+        print(f"指數 API 抓取失敗: {e}")
     return results
 
 def get_institutional_data():
-    """三大法人：官方 OpenAPI (穩定運作中)"""
+    """【還原成功版】使用之前成功抓到 -1208 億的 Yahoo 爬蟲"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
-        res = requests.get(open_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            f_val = t_val = d_val = 0.0
-            has_data = False
-            for row in data:
-                name = str(row.get("Item", row.get("單位名稱", "")))
-                diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
-                try: diff = float(diff_str) / 100000000.0
-                except: diff = 0.0
-                
-                if "外資及陸資" in name or "外資自營商" in name:
-                    f_val += diff
-                    has_data = True
-                elif "投信" in name:
-                    t_val += diff
-                    has_data = True
-                elif "自營商" in name:
-                    d_val += diff
-                    has_data = True
-            if has_data:
-                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
+        url = "https://tw.stock.yahoo.com/institutional-trading"
+        res = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        strings = list(soup.stripped_strings)
+        for i in range(len(strings) - 4):
+            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
+                for j in range(i+4, i+20):
+                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
+                        try:
+                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
+                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
+                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
+                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
+                        except ValueError:
+                            break
     except Exception as e:
-        pass
+        print(f"法人資料抓取失敗: {e}")
     return None, None, None
 
 def calculate_technical_indicators(df):
@@ -118,43 +97,37 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    print("🔄 正在啟動最高層級解析引擎抓取資料...")
-    
     try:
         twii = yf.Ticker("^TWII").history(period="3mo")
-        otc = yf.Ticker("^TWOII").history(period="3mo") 
+        otc = yf.Ticker("TWO.TW").history(period="3mo") # 正確的 YF 櫃買代號 
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
     except Exception as e:
-        return {"error": f"yfinance 發生異常: {e}"}
+        return {"error": f"資料庫異常: {e}"}
 
     if twii.empty or otc.empty: 
-        return {"error": "無法取得歷史資料，請稍後再試。"}
+        return {"error": "無法取得歷史資料。"}
 
-    # 🔥 取得最新標籤資料
-    rt_indices = get_market_indices()
+    # 抓取即時報價
+    rt_indices = get_realtime_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 萬一連標籤都抓不到的最後防線
+    # 備用防呆
     if twii_rt_price is None:
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
-    
     if otc_rt_price is None:
         otc_rt_price = otc.iloc[-1]['Close']
         otc_rt_pct = ((otc.iloc[-1]['Close'] - otc.iloc[-2]['Close']) / otc.iloc[-2]['Close']) * 100 if len(otc)>1 else 0.0
 
+    # 抓取三大法人
     foreign, trust, dealer = get_institutional_data()
 
-    # 將精準即時資料覆蓋回去算指標
+    # 更新 K 線圖計算
     twii.loc[twii.index[-1], 'Close'] = twii_rt_price
     twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
     twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
-
-    otc.loc[otc.index[-1], 'Close'] = otc_rt_price
-    otc.loc[otc.index[-1], 'High'] = max(otc.loc[otc.index[-1], 'High'], otc_rt_price)
-    otc.loc[otc.index[-1], 'Low'] = min(otc.loc[otc.index[-1], 'Low'], otc_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
@@ -163,7 +136,7 @@ def generate_market_text():
     c_vix_price = vix.iloc[-1]['Close'] if not vix.empty else 0
     p_vix_price = vix.iloc[-2]['Close'] if len(vix) > 1 else c_vix_price
 
-    # --- 1. 加權 vs 櫃買 ---
+    # 排版
     tw_icon = "🔴" if twii_rt_pct > 0 else "🟢"
     otc_icon = "🔴" if otc_rt_pct > 0 else "🟢"
     
@@ -180,7 +153,6 @@ def generate_market_text():
                   f"• **櫃買指數 (中小型)**：`{otc_rt_price:,.2f}` 點 ({otc_icon} {otc_rt_pct:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
 
-    # --- 2. 三大法人 ---
     if foreign is not None:
         total_net = foreign + trust + dealer
         inst_text = (f"今日三大法人合計：**{total_net:+.2f} 億元**\n"
@@ -189,7 +161,6 @@ def generate_market_text():
     else:
         inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
-    # --- 3. 大盤技術指標 ---
     rsi = twii.iloc[-1].get('RSI', 50.0)
     k = twii.iloc[-1].get('K', 50.0)
     d = twii.iloc[-1].get('D', 50.0)
@@ -203,13 +174,11 @@ def generate_market_text():
                  f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and twii.iloc[-2].get('K', 50)<twii.iloc[-2].get('D', 50)) else '偏多格局' if k>d else '偏空格局'}\n"
                  f"• **MACD 動能**：{macd_trend}")
 
-    # --- 4. 國際總經與情緒 ---
     vix_trend = "下降" if c_vix_price < p_vix_price else "飆升"
     intl_text = (f"昨夜美股 S&P 500 **{'收紅' if c_sp_price > p_sp_price else '收黑'}** (收 {c_sp_price:,.0f} 點)。\n"
                  f"華爾街 VIX 恐慌指數目前來到 **{c_vix_price:.2f}** ({vix_trend})。\n"
                  f"> 總經視野：{'VIX回落顯示外資避險情緒降溫，有利資金動能' if vix_trend == '下降' else '恐慌情緒升溫，外資可能加速提款'}。")
 
-    # --- 5. 實戰操盤策略 ---
     support = twii['Low'].tail(10).min() 
     resistance = twii['High'].tail(10).max() 
     ma20 = twii.iloc[-1].get('MA20', twii_rt_price)
@@ -268,7 +237,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(絕殺 306 幽靈！採用網頁標籤暴力讀取)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(最終穩定版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
