@@ -12,75 +12,54 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
-# 隱藏憑證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# ================= 絕對必填設定區 =================
 TOKEN = os.getenv('DISCORD_TOKEN')
 if not TOKEN:
-    raise ValueError("❌ 找不到 DISCORD_TOKEN！請確認 .env 設定。")
+    raise ValueError("❌ 找不到 DISCORD_TOKEN！")
 
 TARGET_CHANNEL_ID = 1475023963334643793  
 DAILY_REPORT_TIME = "17:00"   
-# ==================================================
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_market_indices():
-    """【終極直球版】直接爬取使用者提供的專屬網址，拒絕國外延遲 API！"""
+    """【終極網頁標籤截取法】直接讀取 Yahoo 分頁標題，無視所有 API 延遲與網頁改版"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # 🎯 直接鎖定你提供的專屬網址！
     urls = {
         "twii": "https://tw.stock.yahoo.com/quote/^TWII",
-        "otc": "https://tw.stock.yahoo.com/s/otc.php"  # <--- 直接拿你的網址來用！
+        "otc": "https://tw.stock.yahoo.com/quote/^TWOII"
     }
     
     for key, url in urls.items():
         try:
             res = requests.get(url, headers=headers, timeout=10)
+            soup = BeautifulSoup(res.text, 'html.parser')
             
-            # 暴力拆解 Yahoo 網頁底層的原始數據
-            p_match = re.search(r'"regularMarketPrice":\{"raw":([\d\.]+)', res.text)
-            prev_match = re.search(r'"regularMarketPreviousClose":\{"raw":([\d\.]+)', res.text)
+            # 直接抓取網頁的 <title> 標籤
+            # 格式範例: "櫃檯買賣指數 (^TWOII) 288.96 -17.53 (-5.72%) - Yahoo奇摩股市"
+            title_text = soup.title.string if soup.title else ""
             
-            if p_match and prev_match:
-                price = float(p_match.group(1))
-                prev = float(prev_match.group(1))
-                
-                if price > 0 and prev > 0:
-                    pct = ((price - prev) / prev) * 100
-                    results[key] = (price, pct)
+            # 使用正規表達式，精準剪下價格與漲跌幅
+            match = re.search(r'\)\s*([\d\.,]+)\s+.*?\(([\+\-]?[\d\.]+)%\)', title_text)
+            
+            if match:
+                price = float(match.group(1).replace(',', ''))
+                pct = float(match.group(2))
+                results[key] = (price, pct)
+                print(f"✅ {key} 標籤截取成功: {price} ({pct}%)")
         except Exception as e:
-            print(f"{key} 網頁暴力抓取發生異常: {e}")
-
-    # 備用防線：鉅亨網在地 API (雙保險)
-    if results["otc"][0] is None or results["twii"][0] is None:
-        try:
-            url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
-            res = requests.get(url, headers=headers, timeout=5)
-            data = res.json()
-            for item in data.get('items', {}).get('data', []):
-                sym = item.get("symbol", "")
-                p = float(item.get("c", 0))
-                prev = float(item.get("ref_price", 0)) 
-                if p > 0 and prev > 0:
-                    pct = ((p - prev) / prev) * 100
-                    if "TSE01" in sym and results["twii"][0] is None:
-                        results["twii"] = (p, pct)
-                    elif "OTC01" in sym and results["otc"][0] is None:
-                        results["otc"] = (p, pct)
-        except Exception:
-            pass
+            print(f"❌ {key} 標籤截取失敗: {e}")
 
     return results
 
 def get_institutional_data():
-    """三大法人：優先使用證交所 OpenAPI (保證 15:00 更新)"""
-    headers = {"User-Agent": "Mozilla/5.0"}
+    """三大法人：官方 OpenAPI (穩定運作中)"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
         res = requests.get(open_url, headers=headers, timeout=10)
@@ -94,39 +73,19 @@ def get_institutional_data():
                 try: diff = float(diff_str) / 100000000.0
                 except: diff = 0.0
                 
-                if "外資及陸資(不含外資自營商)" in name or "外資自營商" in name:
+                if "外資及陸資" in name or "外資自營商" in name:
                     f_val += diff
                     has_data = True
                 elif "投信" in name:
                     t_val += diff
                     has_data = True
-                elif "自營商(自行買賣)" in name or "自營商(避險)" in name:
+                elif "自營商" in name:
                     d_val += diff
                     has_data = True
             if has_data:
                 return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception as e:
-        print(f"官方 OpenAPI 抓取失敗: {e}")
-
-    try:
-        url = "https://tw.stock.yahoo.com/institutional-trading"
-        res = requests.get(url, headers=headers, verify=False, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        strings = list(soup.stripped_strings)
-        for i in range(len(strings) - 4):
-            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
-                for j in range(i+4, i+20):
-                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
-                        try:
-                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
-                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
-                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
-                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
-                        except ValueError:
-                            break
-    except Exception:
         pass
-
     return None, None, None
 
 def calculate_technical_indicators(df):
@@ -167,17 +126,17 @@ def generate_market_text():
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
     except Exception as e:
-        return {"error": f"yfinance 模組發生異常崩潰: {e}"}
+        return {"error": f"yfinance 發生異常: {e}"}
 
     if twii.empty or otc.empty: 
         return {"error": "無法取得歷史資料，請稍後再試。"}
 
-    # 取得最新雙層裝甲即時資料！
+    # 🔥 取得最新標籤資料
     rt_indices = get_market_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 終極防呆
+    # 萬一連標籤都抓不到的最後防線
     if twii_rt_price is None:
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
@@ -309,7 +268,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(專屬 otc.php 直球修復版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(絕殺 306 幽靈！採用網頁標籤暴力讀取)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
