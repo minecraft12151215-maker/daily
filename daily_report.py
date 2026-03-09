@@ -29,29 +29,48 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_market_indices():
-    """【神級 API 引擎】直接呼叫 Yahoo Finance 官方底層 Chart API，保證秒抓最新即時報價"""
+    """【真・神級在地 API 引擎】全面改用鉅亨網 (cnYES) 官方底層 API，保證秒抓最新即時報價，無懼 Yahoo 斷線與代號錯誤"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    tickers = {"twii": "^TWII", "otc": "^TWOII"}
     
-    for key, ticker in tickers.items():
-        try:
-            # 這是 Yahoo 官方圖表用的底層 API，穩定度 100%，不會被網頁改版影響
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                meta = data['chart']['result'][0]['meta']
-                price = meta['regularMarketPrice']
-                prev = meta['previousClose']
+    # === 🚀 主力引擎：鉅亨網 cnYES即時報價 API ===
+    try:
+        url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data.get('items', {}).get('data', []):
+                sym = item.get("symbol", "")
+                p = float(item.get("c", 0))
+                prev = float(item.get("ref_price", 0)) 
                 
-                # 計算精準漲跌幅
-                if price > 0 and prev > 0:
-                    pct = ((price - prev) / prev) * 100
-                    results[key] = (price, pct)
-        except Exception as e:
-            print(f"Yahoo Chart API ({key}) 發生異常: {e}")
-            
+                if p > 100 and prev > 100:
+                    pct = ((p - prev) / prev) * 100
+                    if "TSE01" in sym:
+                        results["twii"] = (p, pct)
+                    elif "OTC01" in sym:
+                        results["otc"] = (p, pct)
+    except Exception as e:
+        print(f"cnYES 即時報價引擎發生異常: {e}")
+
+    # === 🛡️ 備用引擎：Yahoo Chart API ===
+    tickers = {"twii": "^TWII", "otc": "TWO.TW"} 
+    for key, ticker in tickers.items():
+        if results[key][0] is None:
+            try:
+                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    meta = data['chart']['result'][0]['meta']
+                    price = meta['regularMarketPrice']
+                    prev = meta['previousClose']
+                    if price > 0 and prev > 0:
+                        pct = ((price - prev) / prev) * 100
+                        results[key] = (price, pct)
+            except Exception as e:
+                print(f"Yahoo Chart API ({key}) 發生異常: {e}")
+
     return results
 
 def get_institutional_data():
@@ -160,7 +179,7 @@ def generate_market_text():
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 終極防呆：若全滅退回歷史最後已知價格 (動態計算，不再寫死)
+    # 終極防呆：若全滅退回歷史最後已知價格
     if twii_rt_price is None:
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
@@ -292,7 +311,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載 Chart API 與 OpenAPI 雙引擎)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載 cnYES 與 OpenAPI 真神雙引擎)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
