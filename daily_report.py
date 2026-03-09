@@ -39,7 +39,6 @@ def get_market_indices():
             url = f"https://tw.stock.yahoo.com/quote/{ticker}"
             res = requests.get(url, headers=headers, verify=False, timeout=10)
             
-            # 精準抓取底層的「現價」與「昨收價」
             p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
             prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
             
@@ -47,14 +46,13 @@ def get_market_indices():
                 price = float(p_match.group(1))
                 prev = float(prev_match.group(1))
                 
-                # 自己算漲跌幅，絕對不會被系統的 0.00 騙
                 if price > 100 and prev > 100:
                     pct = ((price - prev) / prev) * 100
                     results[key] = (price, pct)
         except Exception as e:
             print(f"Yahoo JSON 引擎 ({key}) 發生異常: {e}")
 
-    # --- 🛡️ 絕對防線 2：鉅亨網 API (一樣拿昨收自己算) ---
+    # --- 🛡️ 絕對防線 2：鉅亨網 API ---
     if results["twii"][0] is None or results["otc"][0] is None:
         try:
             url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
@@ -64,7 +62,7 @@ def get_market_indices():
                 for item in data['items']['data']:
                     sym = item.get("symbol", "")
                     p = float(item.get("c", 0))
-                    prev = float(item.get("ref_price", 0)) # ref_price 就是昨收平盤價
+                    prev = float(item.get("ref_price", 0)) 
                     
                     if p > 100 and prev > 100:
                         pct = ((p - prev) / prev) * 100
@@ -136,27 +134,29 @@ def generate_market_text():
     
     try:
         twii = yf.Ticker("^TWII").history(period="3mo")
+        otc = yf.Ticker("^TWOII").history(period="3mo") # ✅ 將遺失的 OTC 指數加回來！
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
     except Exception as e:
         return {"error": f"yfinance 模組發生異常崩潰: {e}"}
 
-    if twii.empty: 
-        return {"error": "無法取得大盤基礎歷史資料，請稍後再試。"}
+    if twii.empty or otc.empty: 
+        return {"error": "無法取得大盤或櫃買基礎歷史資料，請稍後再試。"}
 
     # 取得最新雙層裝甲資料
     rt_indices = get_market_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 終極防呆：若全滅退回歷史最後已知價格
+    # 終極防呆：若全滅退回歷史最後已知價格 (動態計算，不再寫死)
     if twii_rt_price is None:
         twii_rt_price = twii.iloc[-1]['Close']
         twii_rt_pct = ((twii.iloc[-1]['Close'] - twii.iloc[-2]['Close']) / twii.iloc[-2]['Close']) * 100 if len(twii)>1 else 0.0
     
     if otc_rt_price is None:
-        otc_rt_price = 306.49  
-        otc_rt_pct = 0.75
+        # ✅ 正確的防呆：抓取 yfinance 最新的櫃買歷史資料來當作備案
+        otc_rt_price = otc.iloc[-1]['Close']
+        otc_rt_pct = ((otc.iloc[-1]['Close'] - otc.iloc[-2]['Close']) / otc.iloc[-2]['Close']) * 100 if len(otc)>1 else 0.0
 
     foreign, trust, dealer = get_institutional_data()
 
@@ -164,6 +164,10 @@ def generate_market_text():
     twii.loc[twii.index[-1], 'Close'] = twii_rt_price
     twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
     twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
+
+    otc.loc[otc.index[-1], 'Close'] = otc_rt_price
+    otc.loc[otc.index[-1], 'High'] = max(otc.loc[otc.index[-1], 'High'], otc_rt_price)
+    otc.loc[otc.index[-1], 'Low'] = min(otc.loc[otc.index[-1], 'Low'], otc_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
@@ -277,7 +281,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(搭載無懼歸零的數學引擎)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(修復櫃買指數卡死 Bug)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
