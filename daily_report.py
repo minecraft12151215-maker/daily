@@ -29,59 +29,58 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_market_indices():
-    """【徹底修復版】使用正確的 ^TWOII 代號，雙層 API 強力抓取最新日收盤價！"""
+    """【終極直球版】直接爬取使用者提供的專屬網址，拒絕國外延遲 API！"""
     results = {"twii": (None, None), "otc": (None, None)}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    
+    # 🎯 直接鎖定你提供的專屬網址！
+    urls = {
+        "twii": "https://tw.stock.yahoo.com/quote/^TWII",
+        "otc": "https://tw.stock.yahoo.com/s/otc.php"  # <--- 直接拿你的網址來用！
     }
     
-    # 💥 這裡就是之前的元凶！現在已經徹底修正為正確的 ^TWOII
-    tickers = {"twii": "^TWII", "otc": "^TWOII"} 
-    
-    # === 🚀 主力引擎：Yahoo Chart 官方底層 API ===
-    for key, ticker in tickers.items():
+    for key, url in urls.items():
         try:
-            # 使用 query1 伺服器，穩定度最高
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1d&interval=1d"
-            res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                meta = data['chart']['result'][0]['meta']
-                price = meta['regularMarketPrice']
-                prev = meta['previousClose']
+            res = requests.get(url, headers=headers, timeout=10)
+            
+            # 暴力拆解 Yahoo 網頁底層的原始數據
+            p_match = re.search(r'"regularMarketPrice":\{"raw":([\d\.]+)', res.text)
+            prev_match = re.search(r'"regularMarketPreviousClose":\{"raw":([\d\.]+)', res.text)
+            
+            if p_match and prev_match:
+                price = float(p_match.group(1))
+                prev = float(prev_match.group(1))
                 
                 if price > 0 and prev > 0:
                     pct = ((price - prev) / prev) * 100
                     results[key] = (price, pct)
         except Exception as e:
-            print(f"Yahoo Chart API ({key}) 發生異常: {e}")
+            print(f"{key} 網頁暴力抓取發生異常: {e}")
 
-    # === 🛡️ 備用引擎：Yahoo 網頁底層 JSON 穿透 (防禦斷線) ===
-    for key, ticker in tickers.items():
-        if results[key][0] is None:
-            try:
-                url = f"https://tw.stock.yahoo.com/quote/{ticker}"
-                res = requests.get(url, headers=headers, verify=False, timeout=5)
-                # 直接暴力抓網頁最底層的報價數據
-                p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-                prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-                
-                if p_match and prev_match:
-                    price = float(p_match.group(1))
-                    prev = float(prev_match.group(1))
-                    if price > 0 and prev > 0:
-                        pct = ((price - prev) / prev) * 100
-                        results[key] = (price, pct)
-            except Exception as e:
-                print(f"Yahoo 備用穿透引擎 ({key}) 發生異常: {e}")
+    # 備用防線：鉅亨網在地 API (雙保險)
+    if results["otc"][0] is None or results["twii"][0] is None:
+        try:
+            url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
+            res = requests.get(url, headers=headers, timeout=5)
+            data = res.json()
+            for item in data.get('items', {}).get('data', []):
+                sym = item.get("symbol", "")
+                p = float(item.get("c", 0))
+                prev = float(item.get("ref_price", 0)) 
+                if p > 0 and prev > 0:
+                    pct = ((p - prev) / prev) * 100
+                    if "TSE01" in sym and results["twii"][0] is None:
+                        results["twii"] = (p, pct)
+                    elif "OTC01" in sym and results["otc"][0] is None:
+                        results["otc"] = (p, pct)
+        except Exception:
+            pass
 
     return results
 
 def get_institutional_data():
     """三大法人：優先使用證交所 OpenAPI (保證 15:00 更新)"""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
         res = requests.get(open_url, headers=headers, timeout=10)
@@ -89,7 +88,6 @@ def get_institutional_data():
             data = res.json()
             f_val = t_val = d_val = 0.0
             has_data = False
-            
             for row in data:
                 name = str(row.get("Item", row.get("單位名稱", "")))
                 diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
@@ -105,13 +103,11 @@ def get_institutional_data():
                 elif "自營商(自行買賣)" in name or "自營商(避險)" in name:
                     d_val += diff
                     has_data = True
-                    
             if has_data:
                 return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception as e:
         print(f"官方 OpenAPI 抓取失敗: {e}")
 
-    # Yahoo 備用
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
         res = requests.get(url, headers=headers, verify=False, timeout=10)
@@ -313,7 +309,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(櫃買代號錯誤已徹底修復！)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(專屬 otc.php 直球修復版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
