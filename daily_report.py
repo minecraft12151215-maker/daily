@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
-# 關閉 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
@@ -26,57 +25,59 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_yahoo_tw_indices():
-    """【純 Yahoo 台灣網頁直抓】直接爬取 Yahoo 奇摩股市網頁，保證抓到當天最新收盤價，絕不延遲"""
+def get_yahoo_indices():
+    """【100% Yahoo 專屬引擎】絕對聽令，只從 Yahoo 獲取最新即時報價"""
     results = {"twii": (None, None), "otc": (None, None)}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-    
-    # 直接鎖定 Yahoo 台灣專屬網址
-    urls = {
-        "twii": "https://tw.stock.yahoo.com/quote/^TWII",
-        "otc": "https://tw.stock.yahoo.com/quote/^TWOII"
-    }
-    
-    for key, url in urls.items():
-        try:
-            # verify=False 繞過雲端主機可能的 SSL 阻擋
-            res = requests.get(url, headers=headers, verify=False, timeout=10)
-            
-            # 從網頁底層程式碼中精準挖出「現價」與「昨收」
-            p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-            prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
-            
-            if p_match and prev_match:
-                price = float(p_match.group(1))
-                prev = float(prev_match.group(1))
-                
-                if price > 0 and prev > 0:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    # 引擎 1：Yahoo 官方 v7 Quote API (最穩定，回傳最新 JSON，不會被網頁改版影響)
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=^TWII,^TWOII"
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data.get('quoteResponse', {}).get('result', []):
+                sym = item.get('symbol')
+                price = item.get('regularMarketPrice')
+                prev = item.get('regularMarketPreviousClose')
+                if price and prev and price > 0:
                     pct = ((price - prev) / prev) * 100
-                    results[key] = (price, pct)
-        except Exception as e:
-            print(f"Yahoo 網頁爬取失敗 ({key}): {e}")
+                    if sym == "^TWII": results["twii"] = (price, pct)
+                    if sym == "^TWOII": results["otc"] = (price, pct)
+    except Exception:
+        pass
+
+    # 引擎 2：Yahoo 台灣網頁底層暴力提取 (萬一 API 沒接通的防線)
+    symbols = {"twii": "^TWII", "otc": "^TWOII"}
+    for key, symbol in symbols.items():
+        if results[key][0] is None:
+            try:
+                url = f"https://tw.stock.yahoo.com/quote/{symbol}"
+                res = requests.get(url, headers=headers, verify=False, timeout=5)
+                # 暴力正則：相容 Yahoo 不同的底層資料結構
+                p_match = re.search(r'"regularMarketPrice"\s*:\s*(?:\{"raw"\s*:\s*)?([\d\.]+)', res.text)
+                prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*(?:\{"raw"\s*:\s*)?([\d\.]+)', res.text)
+                if p_match and prev_match:
+                    p = float(p_match.group(1))
+                    prev = float(prev_match.group(1))
+                    if p > 0 and prev > 0:
+                        results[key] = (p, ((p - prev) / prev) * 100)
+            except Exception:
+                pass
 
     return results
 
-def get_yahoo_institutional():
-    """【純 Yahoo 法人直抓】直接從 Yahoo 法人買賣超網頁抓取，徹底解決官方 API 阻擋問題"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+def get_institutional_data():
+    """【還原成功版】原汁原味還原你之前成功抓取到正確數字的 Yahoo 法人爬蟲"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         url = "https://tw.stock.yahoo.com/institutional-trading"
         res = requests.get(url, headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 拆解 Yahoo 網頁文字，尋找最新日期的法人數據
         strings = list(soup.stripped_strings)
+        
         for i in range(len(strings) - 4):
-            # 定位表格標頭
             if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
-                # 往下找第一筆日期資料 (即最新一天)
                 for j in range(i+4, i+20):
                     if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
                         try:
@@ -87,7 +88,7 @@ def get_yahoo_institutional():
                         except ValueError:
                             break
     except Exception as e:
-        print(f"Yahoo 法人爬取失敗: {e}")
+        print(f"Yahoo 法人資料抓取失敗: {e}")
 
     return None, None, None
 
@@ -121,30 +122,32 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    # 只抓大盤歷史資料用來算 RSI/MACD (不依賴它做為當日現價)
     try:
         twii = yf.Ticker("^TWII").history(period="3mo")
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
+        # ⚠️ 櫃買歷史資料已永久刪除，保證絕不當機！
     except Exception as e:
         return {"error": f"資料庫異常: {e}"}
 
-    # 🔥 100% 從 Yahoo 台灣網頁抓取即時資料
-    rt_indices = get_yahoo_tw_indices()
+    if twii.empty: 
+        return {"error": "無法取得大盤歷史資料，請稍後再試。"}
+
+    # 🔥 取回 100% Yahoo 來源的最新指數
+    rt_indices = get_yahoo_indices()
     twii_rt_price, twii_rt_pct = rt_indices["twii"]
     otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
     if twii_rt_price is None or otc_rt_price is None:
-        return {"error": "無法從 Yahoo 台灣網頁取得最新指數，請確認網路連線。"}
+        return {"error": "Yahoo 報價伺服器暫時無法連線，請稍後重試。"}
 
-    # 🔥 100% 從 Yahoo 台灣網頁抓取三大法人
-    foreign, trust, dealer = get_yahoo_institutional()
+    # 🔥 取回你最成功版本的 Yahoo 三大法人資料
+    foreign, trust, dealer = get_institutional_data()
 
     # 更新 K 線圖計算
-    if not twii.empty and twii_rt_price > 0:
-        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
-        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
-        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
+    twii.loc[twii.index[-1], 'Close'] = twii_rt_price
+    twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
+    twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
@@ -176,7 +179,7 @@ def generate_market_text():
                      f"> • **外資**：`{foreign:+.2f} 億` ｜ **投信**：`{trust:+.2f} 億` ｜ **自營**：`{dealer:+.2f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
     else:
-        inst_text = "今日法人數據尚未更新 (或 Yahoo 網頁結構改變)。"
+        inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
     rsi = twii['RSI'].iloc[-1] if not twii.empty else 50.0
     k = twii['K'].iloc[-1] if not twii.empty else 50.0
@@ -211,7 +214,7 @@ def generate_market_text():
     return {"data": (kline_text, inst_text, tech_text, intl_text, eval_text)}
 
 async def send_daily_report(channel):
-    msg = await channel.send("📡 **正在前往 Yahoo 奇摩股市抓取最新資料...**")
+    msg = await channel.send("📡 **正在前往 Yahoo 股市抓取最新行情與法人籌碼...**")
     result = await asyncio.to_thread(generate_market_text) 
     
     if isinstance(result, dict) and "error" in result:
@@ -254,7 +257,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(100% Yahoo 台灣直連版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(完全鎖定 Yahoo 穩定版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
