@@ -8,7 +8,6 @@ import asyncio
 import requests
 import os
 import re
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
@@ -25,43 +24,44 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_realtime_indices():
-    """【無敵防禦引擎】無視 Yahoo 封鎖，使用保證不擋 IP 的在地 API 抽出最準確現價"""
-    results = {"twii": (None, None), "otc": (None, None)}
-    headers = {"User-Agent": "Mozilla/5.0"}
+def get_institutional_data():
+    """【雙渦輪籌碼引擎】TWSE 新版 RWD API + OpenAPI 雙保險，無視 IP 阻擋"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
+    # 引擎 1：證交所官方新版 RWD API (穩定度最高)
     try:
-        url = "https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:TSE01:INDEX,TWS:OTC01:INDEX"
-        res = requests.get(url, headers=headers, timeout=5)
-        data = res.json()
-        for item in data.get('items', {}).get('data', []):
-            sym = item.get("symbol", "")
-            price = float(item.get("c", 0))
-            prev = float(item.get("ref_price", 0))
-            if price > 0 and prev > 0:
-                pct = ((price - prev) / prev) * 100
-                if "TSE01" in sym:
-                    results["twii"] = (price, pct)
-                elif "OTC01" in sym:
-                    results["otc"] = (price, pct)
+        url1 = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json"
+        res1 = requests.get(url1, headers=headers, timeout=10)
+        if res1.status_code == 200:
+            data1 = res1.json()
+            if data1.get('stat') == 'OK':
+                f_val = t_val = d_val = 0.0
+                for row in data1['data']:
+                    name = row[0]
+                    diff = float(row[3].replace(',', '')) / 100000000.0
+                    if "外資及陸資" in name or "外資自營商" in name:
+                        f_val += diff
+                    elif "投信" in name:
+                        t_val += diff
+                    elif "自營商" in name:
+                        d_val += diff
+                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception:
         pass
-        
-    return results
 
-def get_institutional_data():
-    """三大法人：穩定運作中的證交所 OpenAPI"""
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # 引擎 2：證交所 OpenAPI (備用防線)
     try:
-        open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
-        res = requests.get(open_url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
+        url2 = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
+        res2 = requests.get(url2, headers=headers, timeout=10)
+        if res2.status_code == 200:
+            data2 = res2.json()
             f_val = t_val = d_val = 0.0
             has_data = False
-            for row in data:
-                name = str(row.get("Item", row.get("單位名稱", "")))
-                diff_str = str(row.get("Difference", row.get("買賣差額", "0"))).replace(',', '')
+            for row in data2:
+                name = str(row.get("Item", ""))
+                diff_str = str(row.get("Difference", "0")).replace(',', '')
                 try: diff = float(diff_str) / 100000000.0
                 except: diff = 0.0
                 
@@ -78,6 +78,7 @@ def get_institutional_data():
                 return round(f_val, 2), round(t_val, 2), round(d_val, 2)
     except Exception:
         pass
+        
     return None, None, None
 
 def calculate_technical_indicators(df):
@@ -110,41 +111,29 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
-    # 建立空的 DataFrame 防呆
-    twii = pd.DataFrame()
-    sp500 = pd.DataFrame()
-    vix = pd.DataFrame()
-    
     try:
+        # 🔥 全面回歸 yfinance！大盤已經證明有效，這次把櫃買正確加回來
         twii = yf.Ticker("^TWII").history(period="3mo")
+        otc = yf.Ticker("^TWOII").history(period="3mo") 
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
-    except Exception:
-        pass # 無視所有歷史資料庫異常，繼續執行
+    except Exception as e:
+        return {"error": f"資料庫異常: {e}"}
 
-    # 抓取即時報價 (保證拿到數字)
-    rt_indices = get_realtime_indices()
-    twii_rt_price, twii_rt_pct = rt_indices["twii"]
-    otc_rt_price, otc_rt_pct = rt_indices["otc"]
+    # 絕對防呆機制：確保資料不是空的且至少有兩天可以算漲跌幅
+    if twii.empty or len(twii) < 2: 
+        return {"error": "無法取得大盤歷史資料，請稍後再試。"}
+    if otc.empty or len(otc) < 2:
+        return {"error": "無法取得櫃買歷史資料，請稍後再試。"}
 
-    # 絕對防呆機制 (就算天塌下來也不准當機)
-    if twii_rt_price is None:
-        try:
-            twii_rt_price = twii['Close'].iloc[-1]
-            twii_rt_pct = ((twii['Close'].iloc[-1] - twii['Close'].iloc[-2]) / twii['Close'].iloc[-2]) * 100
-        except:
-            twii_rt_price, twii_rt_pct = 0, 0
-            
-    if otc_rt_price is None:
-        otc_rt_price, otc_rt_pct = 0, 0
+    # 穩定取出最新收盤價與計算漲跌幅
+    twii_rt_price = twii['Close'].iloc[-1]
+    twii_rt_pct = ((twii['Close'].iloc[-1] - twii['Close'].iloc[-2]) / twii['Close'].iloc[-2]) * 100
+    
+    otc_rt_price = otc['Close'].iloc[-1]
+    otc_rt_pct = ((otc['Close'].iloc[-1] - otc['Close'].iloc[-2]) / otc['Close'].iloc[-2]) * 100
 
     foreign, trust, dealer = get_institutional_data()
-
-    # 更新 K 線圖計算
-    if not twii.empty and twii_rt_price > 0:
-        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
-        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
-        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
@@ -214,7 +203,10 @@ async def send_daily_report(channel):
     msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
     result = await asyncio.to_thread(generate_market_text) 
     
-    # 移除了所有錯誤中斷機制，保證一定會發送報表
+    if isinstance(result, dict) and "error" in result:
+        await msg.edit(content=f"⚠️ **系統回報錯誤**：{result['error']}")
+        return
+        
     kline, inst, tech, intl, eval_text = result["data"]
     
     description = (
@@ -251,7 +243,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(無敵金剛不壞版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(回歸 yfinance 與 TWSE 雙引擎)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
