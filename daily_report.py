@@ -27,7 +27,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_accurate_indices():
-    """【終極準確引擎】完全捨棄 yfinance 錯亂報價，使用 urllib 偽裝瀏覽器直連 Yahoo 台灣"""
+    """【終極準確引擎】偽裝瀏覽器直連 Yahoo 台灣"""
     results = {"twii": (None, None), "otc": (None, None)}
     
     # --- 1. 暴力偽裝瀏覽器直取 Yahoo 台灣 (繞過 Requests 阻擋) ---
@@ -57,7 +57,7 @@ def get_accurate_indices():
         except Exception:
             pass
 
-    # --- 2. 備用防線：證交所官方 API (大盤) + 鉅亨網無快取 (櫃買) 保證數字 100% 正確 ---
+    # --- 2. 備用防線：證交所官方 API (大盤) + 鉅亨網無快取 (櫃買) ---
     import time
     req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
@@ -88,7 +88,7 @@ def get_accurate_indices():
     return results
 
 def get_institutional_data():
-    """三大法人：保留上一版已經成功抓出正確數字 (-154.93億) 的證交所 OpenAPI"""
+    """三大法人：保留成功運作的證交所 OpenAPI"""
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         open_url = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
@@ -169,9 +169,13 @@ def generate_market_text():
 
     # 更新指標
     if not twii.empty and twii_rt_price > 0:
-        tw_date_str = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d')
-        twii.loc[tw_date_str] = {'Close': twii_rt_price, 'High': twii_rt_price, 'Low': twii_rt_price}
-        twii = calculate_technical_indicators(twii)
+        # 安全地修改最後一筆資料的收盤價
+        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
+        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
+        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
+
+    # ⚠️【關鍵修復】把這行強制移出 if 判斷式，無條件執行！保證一定會產生 RSI 欄位！
+    twii = calculate_technical_indicators(twii)
 
     c_sp_price = sp500['Close'].iloc[-1] if not sp500.empty else 0
     p_sp_price = sp500['Close'].iloc[-2] if len(sp500) > 1 else c_sp_price
@@ -191,7 +195,6 @@ def generate_market_text():
     else:
         market_style = "【資金輪動，多空震盪】大盤與櫃買走勢分歧，市場處於資金轉換期，建議挑選強勢族群，縮短操作週期。"
 
-    # 大盤顯示到小數點第二位，徹底對齊 Yahoo 畫面
     kline_text = (f"• **加權指數 (大型股)**：`{twii_rt_price:,.2f}` 點 ({tw_icon} {twii_rt_pct:+.2f}%)\n"
                   f"• **櫃買指數 (中小型)**：`{otc_rt_price:,.2f}` 點 ({otc_icon} {otc_rt_pct:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
@@ -204,17 +207,18 @@ def generate_market_text():
     else:
         inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
-    rsi = twii['RSI'].iloc[-1] if not twii.empty else 50.0
-    k = twii['K'].iloc[-1] if not twii.empty else 50.0
-    d = twii['D'].iloc[-1] if not twii.empty else 50.0
-    macd_hist = twii['Hist'].iloc[-1] if not twii.empty else 0.0
-    p_macd_hist = twii['Hist'].iloc[-2] if len(twii) > 1 else 0.0
+    # ⚠️【關鍵修復 2】使用 .get() 加上預設值雙重防護，徹底斷絕 KeyError 可能
+    rsi = twii.iloc[-1].get('RSI', 50.0) if not twii.empty else 50.0
+    k = twii.iloc[-1].get('K', 50.0) if not twii.empty else 50.0
+    d = twii.iloc[-1].get('D', 50.0) if not twii.empty else 50.0
+    macd_hist = twii.iloc[-1].get('Hist', 0.0) if not twii.empty else 0.0
+    p_macd_hist = twii.iloc[-2].get('Hist', 0.0) if len(twii) > 1 else 0.0
     
     rsi_desc = "⚠️ 過熱警報 (隨時面臨修正)" if rsi > 75 else "🟢 落底反彈 (超賣區浮現買點)" if rsi < 30 else "🟡 中性震盪"
     macd_trend = "紅柱擴大，多頭動能強勁" if macd_hist > 0 and macd_hist > p_macd_hist else "紅柱縮減，多方力竭" if macd_hist > 0 else "綠柱縮減，空方力道衰退" if macd_hist < p_macd_hist else "綠柱擴大，空方主導"
     
     tech_text = (f"• **RSI (14)**：`{rsi:.1f}` ｜ {rsi_desc}\n"
-                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and (twii['K'].iloc[-2] if len(twii)>1 else 50) < (twii['D'].iloc[-2] if len(twii)>1 else 50)) else '偏多格局' if k>d else '偏空格局'}\n"
+                 f"• **KD (9,3,3)**：K `{k:.1f}` / D `{d:.1f}` ｜ {'高檔鈍化' if k>80 else '低檔金叉' if (k>d and (twii.iloc[-2].get('K', 50) if len(twii)>1 else 50) < (twii.iloc[-2].get('D', 50) if len(twii)>1 else 50)) else '偏多格局' if k>d else '偏空格局'}\n"
                  f"• **MACD 動能**：{macd_trend}")
 
     vix_trend = "下降" if c_vix_price < p_vix_price else "飆升"
@@ -224,7 +228,7 @@ def generate_market_text():
 
     support = twii['Low'].tail(10).min() if not twii.empty else 0
     resistance = twii['High'].tail(10).max() if not twii.empty else 0
-    ma20 = twii['MA20'].iloc[-1] if not twii.empty else twii_rt_price
+    ma20 = twii.iloc[-1].get('MA20', twii_rt_price) if not twii.empty else twii_rt_price
     
     if twii_rt_price > ma20:
         adv = "大盤穩居月線之上，屬於多頭格局。配合櫃買強弱，可積極在底部起漲的強勢族群中尋找機會。"
@@ -276,7 +280,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(法人正確 + 網頁暴力破解版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(修復 KeyError 完全體)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
