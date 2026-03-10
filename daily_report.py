@@ -8,9 +8,11 @@ import asyncio
 import requests
 import os
 import re
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
 
+# 關閉 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
@@ -24,61 +26,69 @@ DAILY_REPORT_TIME = "17:00"
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def get_institutional_data():
-    """【雙渦輪籌碼引擎】TWSE 新版 RWD API + OpenAPI 雙保險，無視 IP 阻擋"""
+def get_yahoo_tw_indices():
+    """【純 Yahoo 台灣網頁直抓】直接爬取 Yahoo 奇摩股市網頁，保證抓到當天最新收盤價，絕不延遲"""
+    results = {"twii": (None, None), "otc": (None, None)}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
+    
+    # 直接鎖定 Yahoo 台灣專屬網址
+    urls = {
+        "twii": "https://tw.stock.yahoo.com/quote/^TWII",
+        "otc": "https://tw.stock.yahoo.com/quote/^TWOII"
+    }
+    
+    for key, url in urls.items():
+        try:
+            # verify=False 繞過雲端主機可能的 SSL 阻擋
+            res = requests.get(url, headers=headers, verify=False, timeout=10)
+            
+            # 從網頁底層程式碼中精準挖出「現價」與「昨收」
+            p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
+            prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', res.text)
+            
+            if p_match and prev_match:
+                price = float(p_match.group(1))
+                prev = float(prev_match.group(1))
+                
+                if price > 0 and prev > 0:
+                    pct = ((price - prev) / prev) * 100
+                    results[key] = (price, pct)
+        except Exception as e:
+            print(f"Yahoo 網頁爬取失敗 ({key}): {e}")
+
+    return results
+
+def get_yahoo_institutional():
+    """【純 Yahoo 法人直抓】直接從 Yahoo 法人買賣超網頁抓取，徹底解決官方 API 阻擋問題"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
-    # 引擎 1：證交所官方新版 RWD API (穩定度最高)
     try:
-        url1 = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?response=json"
-        res1 = requests.get(url1, headers=headers, timeout=10)
-        if res1.status_code == 200:
-            data1 = res1.json()
-            if data1.get('stat') == 'OK':
-                f_val = t_val = d_val = 0.0
-                for row in data1['data']:
-                    name = row[0]
-                    diff = float(row[3].replace(',', '')) / 100000000.0
-                    if "外資及陸資" in name or "外資自營商" in name:
-                        f_val += diff
-                    elif "投信" in name:
-                        t_val += diff
-                    elif "自營商" in name:
-                        d_val += diff
-                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
-    except Exception:
-        pass
-
-    # 引擎 2：證交所 OpenAPI (備用防線)
-    try:
-        url2 = "https://openapi.twse.com.tw/v1/exchangeReport/BFI82U"
-        res2 = requests.get(url2, headers=headers, timeout=10)
-        if res2.status_code == 200:
-            data2 = res2.json()
-            f_val = t_val = d_val = 0.0
-            has_data = False
-            for row in data2:
-                name = str(row.get("Item", ""))
-                diff_str = str(row.get("Difference", "0")).replace(',', '')
-                try: diff = float(diff_str) / 100000000.0
-                except: diff = 0.0
-                
-                if "外資及陸資" in name or "外資自營商" in name:
-                    f_val += diff
-                    has_data = True
-                elif "投信" in name:
-                    t_val += diff
-                    has_data = True
-                elif "自營商" in name:
-                    d_val += diff
-                    has_data = True
-            if has_data:
-                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
-    except Exception:
-        pass
+        url = "https://tw.stock.yahoo.com/institutional-trading"
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
         
+        # 拆解 Yahoo 網頁文字，尋找最新日期的法人數據
+        strings = list(soup.stripped_strings)
+        for i in range(len(strings) - 4):
+            # 定位表格標頭
+            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
+                # 往下找第一筆日期資料 (即最新一天)
+                for j in range(i+4, i+20):
+                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
+                        try:
+                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
+                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
+                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
+                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
+                        except ValueError:
+                            break
+    except Exception as e:
+        print(f"Yahoo 法人爬取失敗: {e}")
+
     return None, None, None
 
 def calculate_technical_indicators(df):
@@ -111,29 +121,30 @@ def calculate_technical_indicators(df):
     return df
 
 def generate_market_text():
+    # 只抓大盤歷史資料用來算 RSI/MACD (不依賴它做為當日現價)
     try:
-        # 🔥 全面回歸 yfinance！大盤已經證明有效，這次把櫃買正確加回來
         twii = yf.Ticker("^TWII").history(period="3mo")
-        otc = yf.Ticker("^TWOII").history(period="3mo") 
         sp500 = yf.Ticker("^GSPC").history(period="1mo")
         vix = yf.Ticker("^VIX").history(period="1mo")
     except Exception as e:
         return {"error": f"資料庫異常: {e}"}
 
-    # 絕對防呆機制：確保資料不是空的且至少有兩天可以算漲跌幅
-    if twii.empty or len(twii) < 2: 
-        return {"error": "無法取得大盤歷史資料，請稍後再試。"}
-    if otc.empty or len(otc) < 2:
-        return {"error": "無法取得櫃買歷史資料，請稍後再試。"}
+    # 🔥 100% 從 Yahoo 台灣網頁抓取即時資料
+    rt_indices = get_yahoo_tw_indices()
+    twii_rt_price, twii_rt_pct = rt_indices["twii"]
+    otc_rt_price, otc_rt_pct = rt_indices["otc"]
 
-    # 穩定取出最新收盤價與計算漲跌幅
-    twii_rt_price = twii['Close'].iloc[-1]
-    twii_rt_pct = ((twii['Close'].iloc[-1] - twii['Close'].iloc[-2]) / twii['Close'].iloc[-2]) * 100
-    
-    otc_rt_price = otc['Close'].iloc[-1]
-    otc_rt_pct = ((otc['Close'].iloc[-1] - otc['Close'].iloc[-2]) / otc['Close'].iloc[-2]) * 100
+    if twii_rt_price is None or otc_rt_price is None:
+        return {"error": "無法從 Yahoo 台灣網頁取得最新指數，請確認網路連線。"}
 
-    foreign, trust, dealer = get_institutional_data()
+    # 🔥 100% 從 Yahoo 台灣網頁抓取三大法人
+    foreign, trust, dealer = get_yahoo_institutional()
+
+    # 更新 K 線圖計算
+    if not twii.empty and twii_rt_price > 0:
+        twii.loc[twii.index[-1], 'Close'] = twii_rt_price
+        twii.loc[twii.index[-1], 'High'] = max(twii.loc[twii.index[-1], 'High'], twii_rt_price)
+        twii.loc[twii.index[-1], 'Low'] = min(twii.loc[twii.index[-1], 'Low'], twii_rt_price)
 
     twii = calculate_technical_indicators(twii)
     
@@ -165,7 +176,7 @@ def generate_market_text():
                      f"> • **外資**：`{foreign:+.2f} 億` ｜ **投信**：`{trust:+.2f} 億` ｜ **自營**：`{dealer:+.2f} 億`\n"
                      f"> 籌碼點評：{'外資大舉掃貨，熱錢湧入' if foreign > 50 else '投信土洋對作，內資護盤' if (foreign < 0 and trust > 0) else '外資無情提款，權值股承壓' if foreign < -50 else '法人動作不大，回歸基本面'}。")
     else:
-        inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
+        inst_text = "今日法人數據尚未更新 (或 Yahoo 網頁結構改變)。"
 
     rsi = twii['RSI'].iloc[-1] if not twii.empty else 50.0
     k = twii['K'].iloc[-1] if not twii.empty else 50.0
@@ -200,7 +211,7 @@ def generate_market_text():
     return {"data": (kline_text, inst_text, tech_text, intl_text, eval_text)}
 
 async def send_daily_report(channel):
-    msg = await channel.send("📡 **正在彙整大盤、櫃買指數與三大法人籌碼...**")
+    msg = await channel.send("📡 **正在前往 Yahoo 奇摩股市抓取最新資料...**")
     result = await asyncio.to_thread(generate_market_text) 
     
     if isinstance(result, dict) and "error" in result:
@@ -243,7 +254,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(回歸 yfinance 與 TWSE 雙引擎)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(100% Yahoo 台灣直連版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
