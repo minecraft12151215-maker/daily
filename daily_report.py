@@ -28,7 +28,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_realtime_indices():
-    """【完全聽令版】大盤用完美引擎，櫃買用你提供的專屬網址 + 成功突破防線的 urllib 引擎"""
+    """【終極修復版】大盤用完美引擎，櫃買加上標題解析外掛，徹底根絕 0.00"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
@@ -50,41 +50,61 @@ def get_realtime_indices():
         except: pass
 
     # === 2. 櫃買 (OTC) ===
-    # 使用你提供的網址！並套用成功抓到法人的 urllib 破解技術
+    # 針對櫃買專屬網址，啟動三重解析外掛！
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
+    
     urls_to_try = [
-        "https://tw.stock.yahoo.com/s/otc.php",   # 你提供的專屬網址 (第一優先)
-        "https://tw.stock.yahoo.com/quote/^TWOII" # 原廠備用防線
+        "https://tw.stock.yahoo.com/quote/^TWOII", # 直接鎖定最新報價頁面
+        "https://tw.stock.yahoo.com/s/otc.php"     # 你提供的專屬網址作為備用
     ]
     
     for url in urls_to_try:
         if results["otc"][0] is None:
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
+                req = urllib.request.Request(url, headers=req_headers)
+                with urllib.request.urlopen(req, context=ctx, timeout=7) as response:
                     html = response.read().decode('utf-8')
                     
-                    # 暴力破解網頁底層 JSON，直接抽出已算好的現價與漲跌幅
+                    # 方法 A：直接挖網頁最上方的 <title> (最直觀、最不容易壞)
+                    soup = BeautifulSoup(html, 'html.parser')
+                    title = soup.title.string if soup.title else ""
+                    # 匹配範例: 櫃檯買賣指數 (^TWOII) 297.53 +8.57 (+2.97%)
+                    title_match = re.search(r'\)\s*([\d,]+\.\d+)\s+.*?\(([+-]?[\d\.]+)%\)', title)
+                    if title_match:
+                        p = float(title_match.group(1).replace(',', ''))
+                        pct = float(title_match.group(2))
+                        if p > 0:
+                            results["otc"] = (p, pct)
+                            continue
+                            
+                    # 方法 B：暴力破解網頁底層 JSON
                     p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', html)
                     pct_match = re.search(r'"regularMarketChangePercent"\s*:\s*\{"raw"\s*:\s*([-\d\.]+)', html)
-                    
                     if p_match and pct_match:
                         p = float(p_match.group(1))
                         pct = float(pct_match.group(1))
                         if p > 0:
                             results["otc"] = (p, pct)
-                    elif p_match:
-                        # 備用：如果沒算好 %，我們拿昨收自己算
+                            continue
+                            
+                    # 方法 C：JSON 缺趴數時，自己算
+                    if p_match:
                         prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', html)
                         if prev_match:
                             p = float(p_match.group(1))
                             prev = float(prev_match.group(1))
                             if p > 0 and prev > 0:
                                 results["otc"] = (p, ((p - prev) / prev) * 100)
-            except:
+            except Exception as e:
+                print(f"OTC 解析發生錯誤: {e}")
                 pass
 
     return results
@@ -250,7 +270,7 @@ def generate_market_text():
     return {"data": (kline_text, inst_text, tech_text, intl_text, eval_text)}
 
 async def send_daily_report(channel):
-    msg = await channel.send("📡 **正在前往你指定的專屬櫃買網頁抓取數據...**")
+    msg = await channel.send("📡 **正在啟動標題深度解析器抓取櫃買指數...**")
     result = await asyncio.to_thread(generate_market_text) 
     
     kline, inst, tech, intl, eval_text = result["data"]
@@ -270,7 +290,7 @@ async def send_daily_report(channel):
         description=description,
         color=0xf1c40f 
     )
-    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 採用你指定的專屬櫃買網頁")
+    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 採用三重外掛修復櫃買數據")
     
     await msg.edit(content=None, embed=embed)
 
@@ -289,7 +309,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(專屬櫃買網頁破解版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(標題暴力解析版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
