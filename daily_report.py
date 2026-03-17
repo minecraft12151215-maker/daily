@@ -11,6 +11,8 @@ import re
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import urllib3
+import ssl
+import urllib.request
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
@@ -26,12 +28,12 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_realtime_indices():
-    """【完美分離引擎】大盤維持完美的 Yahoo，櫃買單獨隔離使用在地 API"""
+    """【完全聽令版】大盤用完美引擎，櫃買用你提供的專屬網址 + 成功突破防線的 urllib 引擎"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
     # === 1. 大盤 (TWII) ===
-    # 保持使用上一版完美抓出 33,836.57 (+1.48%) 的 Yahoo 引擎
+    # 保持上一版完美抓出 33,836.57 (+1.48%) 的穩定引擎
     try:
         res = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/^TWII", headers=headers, timeout=5)
         meta = res.json()['chart']['result'][0]['meta']
@@ -48,31 +50,42 @@ def get_realtime_indices():
         except: pass
 
     # === 2. 櫃買 (OTC) ===
-    # 徹底捨棄會回傳錯亂 "269.45" 的 Yahoo，改接精準的台灣鉅亨網 API
-    import time
-    try:
-        res = requests.get(f"https://api.cnyes.com/media/api/v1/ticker/realtime/TWS:OTC01:INDEX?_={int(time.time())}", headers=headers, timeout=5)
-        data = res.json()
-        for item in data.get('items', {}).get('data', []):
-            p = float(item.get("c", 0))
-            prev = float(item.get("ref_price", 0))
-            if p > 0 and prev > 0:
-                results["otc"] = (p, ((p - prev) / prev) * 100)
-    except: pass
-
-    # 櫃買備用防線：偽裝成 Google 爬蟲直取 Yahoo 台灣網頁 (繞過雲端主機 403 阻擋)
-    if results["otc"][0] is None:
-        try:
-            bot_headers = {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"}
-            res = requests.get("https://tw.stock.yahoo.com/quote/^TWOII", headers=bot_headers, verify=False, timeout=5)
-            p_match = re.search(r'"regularMarketPrice"\s*:\s*(?:\{"raw"\s*:\s*)?([\d\.]+)', res.text)
-            prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*(?:\{"raw"\s*:\s*)?([\d\.]+)', res.text)
-            if p_match and prev_match:
-                p = float(p_match.group(1))
-                prev = float(prev_match.group(1))
-                if p > 0 and prev > 0:
-                    results["otc"] = (p, ((p - prev) / prev) * 100)
-        except: pass
+    # 使用你提供的網址！並套用成功抓到法人的 urllib 破解技術
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    urls_to_try = [
+        "https://tw.stock.yahoo.com/s/otc.php",   # 你提供的專屬網址 (第一優先)
+        "https://tw.stock.yahoo.com/quote/^TWOII" # 原廠備用防線
+    ]
+    
+    for url in urls_to_try:
+        if results["otc"][0] is None:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
+                    html = response.read().decode('utf-8')
+                    
+                    # 暴力破解網頁底層 JSON，直接抽出已算好的現價與漲跌幅
+                    p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', html)
+                    pct_match = re.search(r'"regularMarketChangePercent"\s*:\s*\{"raw"\s*:\s*([-\d\.]+)', html)
+                    
+                    if p_match and pct_match:
+                        p = float(p_match.group(1))
+                        pct = float(pct_match.group(1))
+                        if p > 0:
+                            results["otc"] = (p, pct)
+                    elif p_match:
+                        # 備用：如果沒算好 %，我們拿昨收自己算
+                        prev_match = re.search(r'"regularMarketPreviousClose"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', html)
+                        if prev_match:
+                            p = float(p_match.group(1))
+                            prev = float(prev_match.group(1))
+                            if p > 0 and prev > 0:
+                                results["otc"] = (p, ((p - prev) / prev) * 100)
+            except:
+                pass
 
     return results
 
@@ -80,22 +93,27 @@ def get_institutional_data():
     """完全還原你提供的 Yahoo 爬蟲版本 (已證明完美抓出 +97.73億)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
-        url = "https://tw.stock.yahoo.com/institutional-trading"
-        res = requests.get(url, headers=headers, verify=False, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        strings = list(soup.stripped_strings)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request("https://tw.stock.yahoo.com/institutional-trading", headers=headers)
         
-        for i in range(len(strings) - 4):
-            if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
-                for j in range(i+4, i+20):
-                    if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
-                        try:
-                            f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
-                            t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
-                            d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
-                            return round(f_val, 2), round(t_val, 2), round(d_val, 2)
-                        except ValueError:
-                            break
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
+            html = response.read().decode('utf-8')
+            soup = BeautifulSoup(html, 'html.parser')
+            strings = list(soup.stripped_strings)
+            
+            for i in range(len(strings) - 4):
+                if strings[i] == "日期" and "外資" in strings[i+1] and "投信" in strings[i+2] and "自營商" in strings[i+3]:
+                    for j in range(i+4, i+20):
+                        if re.match(r'^\d{4}/\d{2}/\d{2}$', strings[j]):
+                            try:
+                                f_val = float(strings[j+1].replace(',', '').replace('+', '').replace('億', '').strip())
+                                t_val = float(strings[j+2].replace(',', '').replace('+', '').replace('億', '').strip())
+                                d_val = float(strings[j+3].replace(',', '').replace('+', '').replace('億', '').strip())
+                                return round(f_val, 2), round(t_val, 2), round(d_val, 2)
+                            except ValueError:
+                                break
     except Exception as e:
         print(f"Yahoo 法人資料抓取失敗: {e}")
 
@@ -214,7 +232,7 @@ def generate_market_text():
 
     vix_trend = "下降" if c_vix_price < p_vix_price else "飆升"
     intl_text = (f"昨夜美股 S&P 500 **{'收紅' if c_sp_price > p_sp_price else '收黑'}** (收 {c_sp_price:,.0f} 點)。\n"
-                 f"华尔街 VIX 恐慌指數目前來到 **{c_vix_price:.2f}** ({vix_trend})。\n"
+                 f"華爾街 VIX 恐慌指數目前來到 **{c_vix_price:.2f}** ({vix_trend})。\n"
                  f"> 總經視野：{'VIX回落顯示外資避險情緒降溫，有利資金動能' if vix_trend == '下降' else '恐慌情緒升溫，外資可能加速提款'}。")
 
     support = twii['Low'].tail(10).min() if not twii.empty else 0
@@ -232,7 +250,7 @@ def generate_market_text():
     return {"data": (kline_text, inst_text, tech_text, intl_text, eval_text)}
 
 async def send_daily_report(channel):
-    msg = await channel.send("📡 **正在彙整當日最新大盤、櫃買指數與三大法人籌碼...**")
+    msg = await channel.send("📡 **正在前往你指定的專屬櫃買網頁抓取數據...**")
     result = await asyncio.to_thread(generate_market_text) 
     
     kline, inst, tech, intl, eval_text = result["data"]
@@ -252,7 +270,7 @@ async def send_daily_report(channel):
         description=description,
         color=0xf1c40f 
     )
-    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 櫃買精準度修復完成")
+    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 採用你指定的專屬櫃買網頁")
     
     await msg.edit(content=None, embed=embed)
 
@@ -271,7 +289,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(完美分離修復版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(專屬櫃買網頁破解版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
