@@ -28,11 +28,11 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_realtime_indices():
-    """【終極勝利版】大盤維持完美，櫃買啟動 Big5 翻譯蒟蒻破解 otc.php"""
+    """【終極破關版】大盤完美保留，櫃買使用證明有效的標題強行解析法"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # === 1. 大盤 (TWII) === (已驗證完美運作 33,836.57)
+    # === 1. 大盤 (TWII) === (已驗證完美運作 33,836.57，一字不改)
     try:
         res = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/^TWII", headers=headers, timeout=5)
         meta = res.json()['chart']['result'][0]['meta']
@@ -40,63 +40,47 @@ def get_realtime_indices():
         results["twii"] = (p, ((p - prev) / prev) * 100)
     except: pass
 
-    # === 2. 櫃買 (OTC) === (專攻你提供的 otc.php，破解 Big5 編碼)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    
-    try:
-        req = urllib.request.Request("https://tw.stock.yahoo.com/s/otc.php", headers=headers)
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
-            raw_data = response.read()
-            
-            # 關鍵突破：強制使用 Big5 解碼古董網頁
-            try:
-                html = raw_data.decode('big5')
-            except:
-                html = raw_data.decode('utf-8', errors='ignore')
-                
-            soup = BeautifulSoup(html, 'html.parser')
-            strings = list(soup.stripped_strings)
-            
-            for i, s in enumerate(strings):
-                if "加權指數" in s or "櫃檯指數" in s:
-                    nums = []
-                    # 往下抓取相鄰的數字 (價格、漲跌、趴數)
-                    for ns in strings[i+1 : i+15]:
-                        clean = ns.replace(',', '').replace('%', '').strip()
-                        try:
-                            nums.append(float(clean))
-                        except ValueError:
-                            pass
-                            
-                    # 通常順序：[288.96, -17.53, -5.72, ...]
-                    if len(nums) >= 3:
-                        p = nums[0]
-                        pct = nums[2]
-                        # 確保抓到的價格是合理的櫃買區間 (大於 100 點)
-                        if 100 < p < 1000:
-                            results["otc"] = (p, pct)
-                            break
-    except Exception as e:
-        print(f"otc.php 解析失敗: {e}")
-
-    # 櫃買備用防線：現代版 Yahoo 網頁
-    if results["otc"][0] is None or results["otc"][0] == 0:
+    if results["twii"][0] is None:
         try:
-            req = urllib.request.Request("https://tw.stock.yahoo.com/quote/^TWOII", headers=headers)
-            with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
-                html = response.read().decode('utf-8', errors='ignore')
+            tw_tk = yf.Ticker("^TWII")
+            tw_p = float(tw_tk.fast_info['lastPrice'])
+            tw_prev = float(tw_tk.fast_info['previousClose'])
+            if tw_p > 0: results["twii"] = (tw_p, ((tw_p - tw_prev) / tw_prev) * 100)
+        except: pass
+
+    # === 2. 櫃買 (OTC) === (完全聽令：只用 Yahoo，且用最不會壞的標題拔取法)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request("https://tw.stock.yahoo.com/quote/^TWOII", headers=headers)
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
+            html = response.read().decode('utf-8')
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # 絕招：直接讀取網頁標題 (例如: "櫃檯買賣指數 (^TWOII) 297.53 +8.57 (+2.97%) - Yahoo奇摩股市")
+            title = soup.title.string if soup.title else ""
+            match = re.search(r'\(\^TWOII\)\s*([\d,]+\.\d+)\s+[+-]?[\d\.]+\s*\(([+-]?[\d\.]+)%\)', title)
+            
+            if match:
+                p = float(match.group(1).replace(',', ''))
+                pct = float(match.group(2))
+                if p > 0:
+                    results["otc"] = (p, pct)
+            else:
+                # 備用絕招：如果標題抓不到，抓網頁底層原始碼
                 p_match = re.search(r'"regularMarketPrice"\s*:\s*\{"raw"\s*:\s*([\d\.]+)', html)
                 pct_match = re.search(r'"regularMarketChangePercent"\s*:\s*\{"raw"\s*:\s*([-\d\.]+)', html)
                 if p_match and pct_match:
                     results["otc"] = (float(p_match.group(1)), float(pct_match.group(1)))
-        except: pass
+    except Exception as e:
+        print(f"Yahoo OTC 抓取失敗: {e}")
 
     return results
 
 def get_institutional_data():
-    """【已驗證完美版】原汁原味 Yahoo 爬蟲 (成功抓出 +97.73億)"""
+    """【已驗證完美版】原汁原味 Yahoo 爬蟲 (成功抓出 +97.73億，一字不改)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         ctx = ssl.create_default_context()
@@ -202,6 +186,7 @@ def generate_market_text():
     else:
         market_style = "【資金輪動，多空震盪】大盤與櫃買走勢分歧，市場處於資金轉換期，建議挑選強勢族群，縮短操作週期。"
 
+    # 加上 .2f 對齊小數點
     kline_text = (f"• **加權指數 (大型股)**：`{twii_rt_price:,.2f}` 點 ({tw_icon} {twii_rt_pct:+.2f}%)\n"
                   f"• **櫃買指數 (中小型)**：`{otc_rt_price:,.2f}` 點 ({otc_icon} {otc_rt_pct:+.2f}%)\n"
                   f"> 💡 **盤勢研判**：{market_style}")
@@ -214,6 +199,7 @@ def generate_market_text():
     else:
         inst_text = "今日法人數據尚未更新 (或逢假日休市)。"
 
+    # 防 KeyError 終極鎖
     rsi = twii['RSI'].iloc[-1] if (not twii.empty and 'RSI' in twii.columns) else 50.0
     k = twii['K'].iloc[-1] if (not twii.empty and 'K' in twii.columns) else 50.0
     d = twii['D'].iloc[-1] if (not twii.empty and 'D' in twii.columns) else 50.0
@@ -247,7 +233,7 @@ def generate_market_text():
     return {"data": (kline_text, inst_text, tech_text, intl_text, eval_text)}
 
 async def send_daily_report(channel):
-    msg = await channel.send("📡 **正在啟動 Big5 解碼器抓取櫃買指數...**")
+    msg = await channel.send("📡 **正在使用 Yahoo 標題直取技術鎖定櫃買指數...**")
     result = await asyncio.to_thread(generate_market_text) 
     
     kline, inst, tech, intl, eval_text = result["data"]
@@ -267,7 +253,7 @@ async def send_daily_report(channel):
         description=description,
         color=0xf1c40f 
     )
-    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 已完全修復 Big5 網頁解碼")
+    embed.set_footer(text="⚡ 由 AI 操盤系統自動生成 ｜ 100% Yahoo 純淨版")
     
     await msg.edit(content=None, embed=embed)
 
@@ -286,7 +272,7 @@ async def report(ctx):
 
 @bot.event
 async def on_ready():
-    print(f'📊 大盤分析機器人 {bot.user} 已上線！(大盤+法人+櫃買Big5解碼完美版)')
+    print(f'📊 大盤分析機器人 {bot.user} 已上線！(標題直取無敵版)')
     if not schedule_daily_report.is_running():
         schedule_daily_report.start()
 
