@@ -57,32 +57,16 @@ def get_realtime_indices():
         except:
             pass
 
-    # === 2. 櫃買 (^TWOII) ===
-    # 策略 A: Yahoo Finance API
+    # === 2. 櫃買 (^TWOII) === API 數據不準，直接用 history
     try:
-        res = requests.get(
-            "https://query2.finance.yahoo.com/v8/finance/chart/%5ETWOII",
-            headers=headers, timeout=5
-        )
-        meta = res.json()['chart']['result'][0]['meta']
-        p = float(meta['regularMarketPrice'])
-        prev = float(meta['previousClose'])
-        if p > 0:
-            results["otc"] = (p, ((p - prev) / prev) * 100)
+        hist = yf.Ticker("^TWOII").history(period="2d")
+        if len(hist) >= 2:
+            p = float(hist['Close'].iloc[-1])
+            prev = float(hist['Close'].iloc[-2])
+            if p > 0:
+                results["otc"] = (p, ((p - prev) / prev) * 100)
     except:
         pass
-
-    # 策略 B: yfinance history 備用
-    if results["otc"][0] is None:
-        try:
-            hist = yf.Ticker("^TWOII").history(period="2d")
-            if len(hist) >= 2:
-                p = float(hist['Close'].iloc[-1])
-                prev = float(hist['Close'].iloc[-2])
-                if p > 0:
-                    results["otc"] = (p, ((p - prev) / prev) * 100)
-        except:
-            pass
 
     return results
 
