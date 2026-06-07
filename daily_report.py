@@ -29,57 +29,71 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def get_realtime_indices():
-    """【終極破關版】大盤完美保留，櫃買修復 URL 編碼錯誤與隱藏通道"""
+    """【修復版】大盤與櫃買指數抓取"""
     results = {"twii": (None, None), "otc": (None, None)}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # === 1. 大盤 (TWII) === (已驗證完美運作 33,836.57，一字不改)
+    # === 1. 大盤 (TWII) ===
+    # 策略 A: Yahoo Finance API
     try:
-        res = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/^TWII", headers=headers, timeout=5)
+        res = requests.get(
+            "https://query2.finance.yahoo.com/v8/finance/chart/%5ETWII",
+            headers=headers, timeout=5
+        )
         meta = res.json()['chart']['result'][0]['meta']
         p, prev = float(meta['regularMarketPrice']), float(meta['previousClose'])
-        results["twii"] = (p, ((p - prev) / prev) * 100)
-    except: pass
+        if p > 0:
+            results["twii"] = (p, ((p - prev) / prev) * 100)
+    except:
+        pass
 
+    # 策略 B: yfinance 備用
     if results["twii"][0] is None:
         try:
             tw_tk = yf.Ticker("^TWII")
             tw_p = float(tw_tk.fast_info['lastPrice'])
             tw_prev = float(tw_tk.fast_info['previousClose'])
-            if tw_p > 0: results["twii"] = (tw_p, ((tw_p - tw_prev) / tw_prev) * 100)
-        except: pass
+            if tw_p > 0:
+                results["twii"] = (tw_p, ((tw_p - tw_prev) / tw_prev) * 100)
+        except:
+            pass
 
-    # === 2. 櫃買 (OTC) === (修復 ^ 符號的編碼錯誤)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    # 策略 A: Yahoo 台灣內部 JSON 通道 (最穩，直接拿數據)
+    # === 2. 櫃買 (TWOII) ===
+    # 策略 A: Yahoo Finance API (跟大盤同樣方式)
     try:
-        # 正確將 ^TWOII 編碼為 %5ETWOII
-        url = "https://tw.stock.yahoo.com/_td-stock/api/resource/StockServices.quotes;symbols=%5ETWOII"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if data and isinstance(data, list):
-                p = float(data[0]['regularMarketPrice']['raw'])
-                pct = float(data[0]['regularMarketChangePercent']['raw'])
-                if p > 0: results["otc"] = (p, pct)
-    except: pass
+        res = requests.get(
+            "https://query2.finance.yahoo.com/v8/finance/chart/%5ETWOII",
+            headers=headers, timeout=5
+        )
+        meta = res.json()['chart']['result'][0]['meta']
+        p, prev = float(meta['regularMarketPrice']), float(meta['previousClose'])
+        if p > 0:
+            results["otc"] = (p, ((p - prev) / prev) * 100)
+    except:
+        pass
 
-    # 策略 B: Yahoo 台灣網頁正則硬解 (備用防線)
-    if results["otc"][0] is None or results["otc"][0] == 0:
+    # 策略 B: yfinance 備用
+    if results["otc"][0] is None:
         try:
-            # 正確將 ^TWOII 編碼為 %5ETWOII
-            url = "https://tw.stock.yahoo.com/quote/%5ETWOII" 
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
-                html = response.read().decode('utf-8', errors='ignore')
-                p_match = re.search(r'"symbol":"\^TWOII".*?"regularMarketPrice":\{"raw":([\d\.]+)', html)
-                pct_match = re.search(r'"symbol":"\^TWOII".*?"regularMarketChangePercent":\{"raw":([-\d\.]+)', html)
-                if p_match and pct_match:
-                    results["otc"] = (float(p_match.group(1)), float(pct_match.group(1)))
-        except: pass
+            otc_tk = yf.Ticker("^TWOII")
+            otc_p = float(otc_tk.fast_info['lastPrice'])
+            otc_prev = float(otc_tk.fast_info['previousClose'])
+            if otc_p > 0:
+                results["otc"] = (otc_p, ((otc_p - otc_prev) / otc_prev) * 100)
+        except:
+            pass
+
+    # 策略 C: 最終備用，抓歷史收盤價
+    if results["otc"][0] is None:
+        try:
+            otc_hist = yf.Ticker("^TWOII").history(period="2d")
+            if len(otc_hist) >= 2:
+                otc_p = float(otc_hist['Close'].iloc[-1])
+                otc_prev = float(otc_hist['Close'].iloc[-2])
+                if otc_p > 0:
+                    results["otc"] = (otc_p, ((otc_p - otc_prev) / otc_prev) * 100)
+        except:
+            pass
 
     return results
 
